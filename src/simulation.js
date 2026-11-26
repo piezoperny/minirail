@@ -1,4 +1,5 @@
-import { CONFIG, edgeKey, orderedPair } from './state.js';
+import { CONFIG, edgeKey, orderedPair, recordTrainHistory } from './state.js';
+import { spawnPuff, spawnTokenHop, spawnFloatingToast } from './fx.js';
 import {
   buildOctilinearPoints,
   computeHillIntervals,
@@ -7,6 +8,46 @@ import {
   samplePointAlongPolyline,
   spawnNextStation,
 } from './mapGen.js';
+
+function createToken(state, kind, extra = {}) {
+  const service = kind === 'raw' || kind === 'goods' ? 'freight' : 'express';
+  return {
+    id: state.nextTokenId++,
+    kind,
+    service,
+    targetCityId: extra.targetCityId ?? null,
+    cityCode: extra.cityCode ?? null,
+    crestColor: extra.crestColor ?? null,
+    spawnedAt: state.simTime || 0,
+  };
+}
+
+export function initStarterLine(state) {
+  const starterIds = state.onboarding?.starterIds;
+  if (!starterIds) return;
+  const { townId, cityId } = starterIds;
+  const townSt = state.stationById.get(townId);
+  const citySt = state.stationById.get(cityId);
+  if (!townSt || !citySt) return;
+
+  const line = state.lines[0];
+  if (!line || line.stations.length > 0) return;
+
+  const check = canAddCorridorForLine(state, townId, cityId);
+  if (!check.ok) return;
+
+  line.stations = [townId, cityId];
+  line.isLoop = false;
+  activateCorridorForLine(state, line, townId, cityId);
+
+  if (state.inventory.express > 0) {
+    deployTrainOnLine(state, 'express', 0, townId);
+  }
+
+  // Seed initial passengers so trains board and move immediately on load
+  townSt.queue.push(createToken(state, 'commuter'), createToken(state, 'commuter'));
+  citySt.queue.push(createToken(state, 'local'));
+}
 
 export function getOrCreateCorridor(state, id1, id2) {
   const [aId, bId] = orderedPair(id1, id2);
@@ -130,6 +171,13 @@ function deactivateLineEdge(state, line, id1, id2) {
   }
 }
 
+function checkFreightOnboarding(state, stationId) {
+  const st = state.stationById.get(stationId);
+  if (st && (st.kind === 'resource' || st.kind === 'factory')) {
+    if (state.onboarding) state.onboarding.freightLineBuilt = true;
+  }
+}
+
 export function extendOrStartLine(state, lineId, fromId, toId) {
   if (fromId === toId) return { ok: false, reason: 'Cannot connect station to itself' };
   const line = state.lines[lineId];
@@ -141,6 +189,30 @@ export function extendOrStartLine(state, lineId, fromId, toId) {
     line.stations = [fromId, toId];
     line.isLoop = false;
     activateCorridorForLine(state, line, fromId, toId);
+
+    const fromSt = state.stationById.get(fromId);
+    const toSt = state.stationById.get(toId);
+    const isFreightPair =
+      (fromSt && (fromSt.kind === 'resource' || fromSt.kind === 'factory')) ||
+      (toSt && (toSt.kind === 'resource' || toSt.kind === 'factory'));
+    if (isFreightPair && state.onboarding) {
+      state.onboarding.freightLineBuilt = true;
+    }
+
+    const preferred = isFreightPair ? 'freight' : 'express';
+    if (state.inventory[preferred] > 0) {
+      const deployed = deployTrainOnLine(state, preferred, lineId, fromId);
+      if (deployed.ok && fromSt && toSt) {
+        spawnFloatingToast(
+          state,
+          (fromSt.x + toSt.x) * 0.5,
+          (fromSt.y + toSt.y) * 0.5 - 10,
+          preferred === 'freight' ? 'Freight Dispatched!' : 'Express Dispatched!',
+          line.color
+        );
+      }
+    }
+
     return { ok: true };
   }
 
@@ -165,6 +237,7 @@ export function extendOrStartLine(state, lineId, fromId, toId) {
     const check = canAddCorridorForLine(state, lastId, toId);
     if (!check.ok) return check;
     line.stations.push(toId);
+    checkFreightOnboarding(state, toId);
     activateCorridorForLine(state, line, lastId, toId);
     return { ok: true };
   }
@@ -187,6 +260,7 @@ export function extendOrStartLine(state, lineId, fromId, toId) {
     const check = canAddCorridorForLine(state, firstId, toId);
     if (!check.ok) return check;
     line.stations.unshift(toId);
+    checkFreightOnboarding(state, toId);
     // Shift train station indices on this line by +1
     for (const tr of state.trains) {
       if (tr.lineId === lineId) tr.stationIndex += 1;
@@ -342,6 +416,25 @@ export function removeSegmentFromLine(state, lineId, id1, id2) {
 
 // ---------- Fleet & Upgrade Helpers ----------
 
+function computeInitialTrainAngle(state, line, stationIndex, direction) {
+  const next = getNextStop(line, stationIndex, direction);
+  const fromId = line.stations[stationIndex];
+  const st = state.stationById.get(fromId);
+  if (!next || !st) return 0;
+  const toId = line.stations[next.nextIndex];
+  const corridor = state.corridors.get(edgeKey(fromId, toId));
+  if (corridor && corridor.points.length >= 2) {
+    const dir = fromId === corridor.aId ? 'AtoB' : 'BtoA';
+    const arcS = dir === 'AtoB' ? 0 : corridor.totalLength;
+    const pt = samplePointAlongPolyline(corridor.points, corridor.cumLengths, arcS);
+    const sign = dir === 'AtoB' ? 1 : -1;
+    return Math.atan2(pt.ty * sign, pt.tx * sign);
+  }
+  const nextSt = state.stationById.get(toId);
+  if (!nextSt) return 0;
+  return Math.atan2(nextSt.y - st.y, nextSt.x - st.x);
+}
+
 export function deployTrainOnLine(state, type, lineId, stationId = null) {
   const line = state.lines[lineId];
   if (!line || line.stations.length < 2) return { ok: false, reason: 'Line needs 2+ stations' };
@@ -354,37 +447,45 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
     if (found >= 0) stationIndex = found;
   }
   const st = state.stationById.get(line.stations[stationIndex]);
+  const direction = stationIndex === line.stations.length - 1 ? -1 : 1;
+  const angle = computeInitialTrainAngle(state, line, stationIndex, direction);
   const train = {
     id: state.nextTrainId++,
     type,
     lineId,
-    cars: 0,
+    cars: CONFIG.TRAIN_DEFAULT_CARS,
     cargo: [],
     state: 'atStation',
     stationIndex,
-    direction: stationIndex === line.stations.length - 1 ? -1 : 1,
+    direction,
     dwellTimer: 0.25,
+    exchangedAtStop: false,
     corridorKey: null,
     corridorDir: 'AtoB',
     fromStationId: null,
     toStationId: null,
     s: 0,
+    currentSpeed: 0,
+    totalTraveled: 0,
+    pathHistory: [],
+    exhaustTimer: 0,
     lane: 0,
     lateralOffset: 0,
     x: st.x,
     y: st.y,
-    angle: 0,
+    angle,
   };
+  recordTrainHistory(train, st.x, st.y, angle, 0);
   state.trains.push(train);
   return { ok: true, train };
 }
 
 export function attachCarToTrain(state, trainId) {
-  if (state.inventory.car <= 0) return { ok: false, reason: 'No Extra Railcars' };
+  if (state.inventory.car <= 0) return { ok: false, reason: 'No Extra Carriages' };
   const tr = state.trains.find((t) => t.id === trainId);
   if (!tr) return { ok: false };
   if (tr.cars >= CONFIG.MAX_CARS_PER_TRAIN) {
-    return { ok: false, reason: 'Max 2 railcars per train' };
+    return { ok: false, reason: `Max ${CONFIG.MAX_CARS_PER_TRAIN} carriages per train` };
   }
   state.inventory.car -= 1;
   tr.cars += 1;
@@ -405,7 +506,7 @@ export function reclaimTrainToInventory(state, trainId) {
     }
   }
   state.inventory[tr.type] += 1;
-  state.inventory.car += tr.cars;
+  state.inventory.car += Math.max(0, tr.cars - CONFIG.TRAIN_DEFAULT_CARS);
   state.trains.splice(idx, 1);
   return true;
 }
@@ -425,8 +526,10 @@ export function moveTrainToLine(state, trainId, targetLineId, stationId = null) 
   tr.lineId = targetLineId;
   tr.corridorKey = null;
   tr.state = 'atStation';
+  tr.exchangedAtStop = false;
   tr.lane = 0;
   tr.lateralOffset = 0;
+  tr.currentSpeed = 0;
   let sIdx = 0;
   if (stationId !== null) {
     const found = line.stations.indexOf(stationId);
@@ -436,8 +539,13 @@ export function moveTrainToLine(state, trainId, targetLineId, stationId = null) 
   tr.direction = sIdx === line.stations.length - 1 ? -1 : 1;
   tr.dwellTimer = 0.25;
   const st = state.stationById.get(line.stations[sIdx]);
+  const angle = computeInitialTrainAngle(state, line, sIdx, tr.direction);
   tr.x = st.x;
   tr.y = st.y;
+  tr.angle = angle;
+  tr.totalTraveled = 0;
+  tr.pathHistory = [];
+  recordTrainHistory(tr, st.x, st.y, angle, 0);
   return { ok: true };
 }
 
@@ -598,25 +706,39 @@ function updateTrainPoseOnCorridor(state, train, corridor) {
 // ---------- Demand, BFS Routing & Station Overflow ----------
 
 function getTrainCapacity(train) {
-  return CONFIG.TRAIN_BASE_CAPACITY + train.cars * CONFIG.CAR_CAPACITY_BONUS;
+  return train.cars * CONFIG.CAR_CAPACITY;
 }
 
-function getServiceTypeForShape(shape) {
-  return shape === 'diamond' ? 'freight' : 'express';
+function tokenMatchesStation(tok, st, forRouting = false) {
+  if (!tok || !st) return false;
+  switch (tok.kind) {
+    case 'commuter':
+      return st.kind === 'settlement' && st.tier === 3;
+    case 'local':
+      return st.kind === 'settlement' && st.tier < 3;
+    case 'intercity':
+      return st.kind === 'settlement' && st.id === tok.targetCityId;
+    case 'raw':
+      if (st.kind !== 'factory') return false;
+      return forRouting ? true : st.inputBuffer < CONFIG.FACTORY_INPUT_MAX;
+    case 'goods':
+      return st.kind === 'settlement';
+    default:
+      return false;
+  }
 }
 
-function getLineDirectShapes(state, lineId) {
+function lineHasMatchingStation(state, lineId, tok) {
   const line = state.lines[lineId];
-  const shapes = new Set();
-  if (!line) return shapes;
+  if (!line) return false;
   for (const sId of line.stations) {
     const st = state.stationById.get(sId);
-    if (st) shapes.add(st.shape);
+    if (st && tokenMatchesStation(tok, st, true)) return true;
   }
-  return shapes;
+  return false;
 }
 
-function findBfsFirstLines(state, startStationId, targetShape, serviceType) {
+function findBfsFirstLines(state, startStationId, tok, serviceType) {
   const activeLines = state.lines.filter(
     (l) =>
       l.stations.length >= 2 &&
@@ -642,7 +764,7 @@ function findBfsFirstLines(state, startStationId, targetShape, serviceType) {
   const firstLines = new Map(); // stationId -> Set<lineId>
   const queue = [startStationId];
   let bestTargetDist = Infinity;
-  const winningLines = new Set();
+  const matchedAtBestDist = [];
 
   for (let head = 0; head < queue.length; head++) {
     const curr = queue[head];
@@ -650,10 +772,9 @@ function findBfsFirstLines(state, startStationId, targetShape, serviceType) {
     if (d > bestTargetDist) break;
 
     const st = state.stationById.get(curr);
-    if (curr !== startStationId && st && st.shape === targetShape) {
+    if (curr !== startStationId && st && tokenMatchesStation(tok, st, true)) {
       bestTargetDist = d;
-      const fl = firstLines.get(curr);
-      if (fl) fl.forEach((lid) => winningLines.add(lid));
+      matchedAtBestDist.push(st);
       continue;
     }
 
@@ -674,28 +795,129 @@ function findBfsFirstLines(state, startStationId, targetShape, serviceType) {
     }
   }
 
+  if (matchedAtBestDist.length === 0) return new Set();
+
+  let chosenTargets = matchedAtBestDist;
+  if (tok.kind === 'raw') {
+    const withSpace = matchedAtBestDist.filter((st) => st.inputBuffer < CONFIG.FACTORY_INPUT_MAX);
+    if (withSpace.length > 0) chosenTargets = withSpace;
+  } else if (tok.kind === 'goods') {
+    const growingTowns = matchedAtBestDist.filter((st) => st.tier < 3);
+    if (growingTowns.length > 0) chosenTargets = growingTowns;
+  }
+
+  const winningLines = new Set();
+  for (const st of chosenTargets) {
+    const fl = firstLines.get(st.id);
+    if (fl) fl.forEach((lid) => winningLines.add(lid));
+  }
   return winningLines;
+}
+
+function assignUniqueCityIdentity(state, st) {
+  const usedCodes = new Set();
+  const usedColors = new Set();
+  for (const s of state.stations) {
+    if (s.id === st.id) continue;
+    if (s.cityCode) usedCodes.add(s.cityCode);
+    if (s.crestColor) usedColors.add(s.crestColor);
+  }
+
+  if (!st.cityCode) {
+    const entry = CONFIG.SETTLEMENT_NAMES.find(([name]) => name === st.name);
+    let code = entry ? entry[1] : st.name.slice(0, 2).toUpperCase();
+    if (usedCodes.has(code)) {
+      const alt = `${st.name[0]}${st.name[st.name.length - 1]}`.toUpperCase();
+      code = usedCodes.has(alt) ? `C${st.id}` : alt;
+    }
+    st.cityCode = code;
+  }
+
+  if (!st.crestColor) {
+    const freeColor = CONFIG.CITY_CREST_PALETTE.find((c) => !usedColors.has(c));
+    st.crestColor =
+      freeColor ||
+      CONFIG.CITY_CREST_PALETTE[(state.citiesGrown + st.id) % CONFIG.CITY_CREST_PALETTE.length];
+  }
+}
+
+function handleSettlementGoodsDelivery(state, st, hooks) {
+  st.goodsProgress = (st.goodsProgress || 0) + 1;
+  if (st.tier < 3 && st.goodsTarget && st.goodsProgress >= st.goodsTarget) {
+    st.goodsProgress -= st.goodsTarget;
+    st.tier += 1;
+    const tierSpec = CONFIG.SETTLEMENT_TIERS[st.tier];
+    st.subtype = tierSpec.subtype;
+    st.capacity = tierSpec.capacity;
+    st.goodsTarget = tierSpec.goodsTarget;
+    st.pulse = 1.2;
+    state.citiesGrown += 1;
+
+    if (st.tier === 3) {
+      assignUniqueCityIdentity(state, st);
+    }
+
+    const bonusPool = [
+      { key: 'doubleTrack', label: 'DOUBLE-TRACK' },
+      { key: 'tunnel', label: 'TUNNEL' },
+      { key: 'bridge', label: 'BRIDGE' },
+      { key: 'car', label: 'CARRIAGE' },
+    ];
+    const bonus = bonusPool[(state.citiesGrown - 1) % bonusPool.length];
+    state.inventory[bonus.key] = (state.inventory[bonus.key] || 0) + 1;
+
+    hooks?.onCityGrow?.(st);
+    spawnFloatingToast(
+      state,
+      st.x,
+      st.y - 14,
+      `${st.name} grew into a ${st.tier === 3 ? 'City' : 'Town'}! +1 ${bonus.label}`,
+      '#2F855A'
+    );
+  }
 }
 
 function handleStationExchange(state, train, station, hooks) {
   let didActivity = false;
   const line = state.lines[train.lineId];
-  const directShapes = getLineDirectShapes(state, train.lineId);
 
   // 1. Unload deliveries or transfers
   for (let i = train.cargo.length - 1; i >= 0; i--) {
     const tok = train.cargo[i];
-    if (tok.targetShape === station.shape) {
+    if (tokenMatchesStation(tok, station, false)) {
       train.cargo.splice(i, 1);
-      state.deliveriesTotal += 1;
-      if (tok.targetShape === 'diamond') state.deliveriesCargo += 1;
-      else state.deliveriesPassengers += 1;
       didActivity = true;
-      hooks?.onDelivery?.(tok.targetShape);
-    } else if (!directShapes.has(tok.targetShape)) {
+
+      if (tok.kind === 'raw') {
+        station.inputBuffer = (station.inputBuffer || 0) + 1;
+        state.deliveriesTotal += 1;
+        state.deliveriesCargo += 1;
+        spawnTokenHop(state, train.x, train.y, station.x, station.y, 'raw', '#C05621');
+        hooks?.onDelivery?.('raw');
+      } else if (tok.kind === 'goods') {
+        state.deliveriesTotal += 2;
+        state.deliveriesCargo += 1;
+        state.deliveriesGoods += 1;
+        spawnTokenHop(state, train.x, train.y, station.x, station.y, 'goods', '#2B6CB0');
+        handleSettlementGoodsDelivery(state, station, hooks);
+        hooks?.onDelivery?.('goods');
+      } else {
+        state.deliveriesTotal += 1;
+        state.deliveriesPassengers += 1;
+        spawnTokenHop(
+          state,
+          train.x,
+          train.y,
+          station.x,
+          station.y,
+          tok.kind,
+          tok.crestColor || '#232629'
+        );
+        hooks?.onDelivery?.(tok.kind);
+      }
+    } else if (!lineHasMatchingStation(state, train.lineId, tok)) {
       // Needs transfer at this interchange if another active line can carry it
-      const service = getServiceTypeForShape(tok.targetShape);
-      const nextLines = findBfsFirstLines(state, station.id, tok.targetShape, service);
+      const nextLines = findBfsFirstLines(state, station.id, tok, tok.service);
       const hasOtherLine = Array.from(nextLines).some((lid) => lid !== train.lineId);
       if (hasOtherLine) {
         train.cargo.splice(i, 1);
@@ -710,15 +932,24 @@ function handleStationExchange(state, train, station, hooks) {
   if (train.cargo.length < cap && station.queue.length > 0 && line && line.stations.length >= 2) {
     for (let i = 0; i < station.queue.length && train.cargo.length < cap; ) {
       const tok = station.queue[i];
-      if (getServiceTypeForShape(tok.targetShape) !== train.type) {
+      if (tok.service !== train.type) {
         i++;
         continue;
       }
-      const validLines = findBfsFirstLines(state, station.id, tok.targetShape, train.type);
+      const validLines = findBfsFirstLines(state, station.id, tok, train.type);
       if (validLines.has(train.lineId)) {
         station.queue.splice(i, 1);
         train.cargo.push(tok);
         didActivity = true;
+        spawnTokenHop(
+          state,
+          station.x,
+          station.y,
+          train.x,
+          train.y,
+          tok.kind,
+          tok.crestColor || (tok.service === 'freight' ? '#C05621' : '#232629')
+        );
       } else {
         i++;
       }
@@ -740,22 +971,65 @@ function stepDemandAndSpawns(state, simDt, hooks) {
     }
   }
 
-  // Demand generation & overflow timers
+  // Demand generation, factory processing & overflow timers
   const demandRateMult = 1 + (state.week - 1) * 0.16;
 
   for (const st of state.stations) {
-    if (st.shape !== 'diamond') {
+    if (st.kind === 'resource') {
       st.spawnTimer -= simDt * demandRateMult;
       if (st.spawnTimer <= 0) {
-        const baseInterval = st.shape === 'triangle' ? 8.6 : 7.4;
+        st.spawnTimer = 8.6 * (0.85 + state.rng() * 0.35);
+        st.queue.push(createToken(state, 'raw'));
+      }
+    } else if (st.kind === 'factory') {
+      if ((st.inputBuffer || 0) > 0 && st.queue.length < st.capacity) {
+        st.processProgress = (st.processProgress || 0) + simDt / CONFIG.FACTORY_PROCESS_TIME;
+        st.smokeTimer = (st.smokeTimer ?? 0) - simDt;
+        if (st.smokeTimer <= 0) {
+          st.smokeTimer = 0.42 + state.rng() * 0.25;
+          spawnPuff(state, st.x + 6, st.y - 16, {
+            startR: 3,
+            endR: 11,
+            vx: 6 + (state.rng() - 0.5) * 6,
+            vy: -22,
+            life: 0.95,
+            color: 'rgba(130, 125, 118, 0.55)',
+          });
+        }
+        if (st.processProgress >= 1) {
+          st.processProgress -= 1;
+          st.inputBuffer = Math.max(0, st.inputBuffer - 1);
+          st.queue.push(createToken(state, 'goods'));
+          st.pulse = Math.max(st.pulse || 0, 0.45);
+        }
+      } else if ((st.inputBuffer || 0) === 0) {
+        st.processProgress = 0;
+      }
+    } else if (st.kind === 'settlement') {
+      st.spawnTimer -= simDt * demandRateMult;
+      if (st.spawnTimer <= 0) {
+        const baseInterval = st.tier === 3 ? 7.0 : 7.8;
         st.spawnTimer = baseInterval * (0.85 + state.rng() * 0.35);
 
-        let targetShape = 'circle';
-        if (st.shape === 'square') targetShape = 'circle';
-        else if (st.shape === 'circle') targetShape = 'square';
-        else if (st.shape === 'triangle') targetShape = 'diamond';
-
-        st.queue.push({ targetShape, spawnedAt: state.simTime });
+        if (st.tier < 3) {
+          st.queue.push(createToken(state, 'commuter'));
+        } else {
+          const otherCities = state.stations.filter(
+            (s) => s.kind === 'settlement' && s.tier === 3 && s.id !== st.id
+          );
+          if (otherCities.length >= 1 && state.rng() < 0.5) {
+            const targetCity = otherCities[Math.floor(state.rng() * otherCities.length)];
+            st.queue.push(
+              createToken(state, 'intercity', {
+                targetCityId: targetCity.id,
+                cityCode: targetCity.cityCode,
+                crestColor: targetCity.crestColor,
+              })
+            );
+          } else {
+            st.queue.push(createToken(state, 'local'));
+          }
+        }
       }
     }
 
@@ -764,13 +1038,8 @@ function stepDemandAndSpawns(state, simDt, hooks) {
       if (st.overflowTimer >= CONFIG.OVERFLOW_DURATION) {
         state.phase = 'gameover';
         state.speed = 0;
-        const labelMap = {
-          square: 'Village',
-          circle: 'City',
-          triangle: 'Resource Site',
-          diamond: 'Industrial Port',
-        };
-        state.gameOverReason = `A ${labelMap[st.shape] || 'station'} exceeded its ${st.capacity}-unit capacity for 30 seconds.`;
+        const label = st.name || st.subtype || 'Station';
+        state.gameOverReason = `${label} exceeded its ${st.capacity}-unit capacity for 30 seconds.`;
         hooks?.onGameOver?.();
         return;
       }
@@ -778,6 +1047,35 @@ function stepDemandAndSpawns(state, simDt, hooks) {
       st.overflowTimer = Math.max(0, st.overflowTimer - simDt * CONFIG.OVERFLOW_DRAIN_RATE);
     }
   }
+}
+
+function shouldBrakeForStop(state, tr, line, toStation) {
+  if (!line || !toStation) return true;
+  if (!line.isLoop && (tr.stationIndex === 0 || tr.stationIndex === line.stations.length - 1)) {
+    return true;
+  }
+  if (tr.cargo.some((tok) => tokenMatchesStation(tok, toStation, false))) {
+    return true;
+  }
+  if (
+    tr.cargo.length < getTrainCapacity(tr) &&
+    toStation.queue.some((tok) => tok.service === tr.type)
+  ) {
+    return true;
+  }
+  const next = getNextStop(line, tr.stationIndex, tr.direction);
+  if (next) {
+    const fromId = line.stations[tr.stationIndex];
+    const nextToId = line.stations[next.nextIndex];
+    const nextCorr = state.corridors.get(edgeKey(fromId, nextToId));
+    if (nextCorr && !nextCorr.isDoubleTrack) {
+      const nextDir = fromId === nextCorr.aId ? 'AtoB' : 'BtoA';
+      if (nextCorr.lockedDirection && nextCorr.lockedDirection !== nextDir) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function stepTrains(state, simDt, hooks) {
@@ -791,6 +1089,7 @@ function stepTrains(state, simDt, hooks) {
     }
 
     if (tr.state === 'atStation') {
+      tr.currentSpeed = 0;
       if (!tr.exchangedAtStop) {
         const st = state.stationById.get(line.stations[tr.stationIndex]);
         if (st) {
@@ -805,6 +1104,7 @@ function stepTrains(state, simDt, hooks) {
     }
 
     if (tr.state === 'waitingBlock') {
+      tr.currentSpeed = 0;
       const next = getNextStop(line, tr.stationIndex, tr.direction);
       if (!next) continue;
       const fromId = line.stations[tr.stationIndex];
@@ -858,7 +1158,8 @@ function stepTrains(state, simDt, hooks) {
           : CONFIG.FREIGHT_HILL_MULT
         : 1.0;
 
-      let speed = baseSpeed * hillMult;
+      const maxSpeed = baseSpeed * hillMult;
+      let targetSpeed = maxSpeed;
 
       let leader = null;
       let minGap = Infinity;
@@ -899,11 +1200,38 @@ function stepTrains(state, simDt, hooks) {
         }
       }
 
-      let nextS = tr.s + speed * simDt;
+      const distRemaining = total - tr.s;
+      const toStation = state.stationById.get(tr.toStationId);
+      if (distRemaining < 45 && shouldBrakeForStop(state, tr, line, toStation)) {
+        const brakeTarget = Math.max(26, maxSpeed * (distRemaining / 45));
+        targetSpeed = Math.min(targetSpeed, brakeTarget);
+      }
+
+      if (leader && minGap < CONFIG.SAFE_GAP + 28) {
+        const leaderSpeed = leader.currentSpeed ?? maxSpeed;
+        const followTarget =
+          minGap <= CONFIG.SAFE_GAP
+            ? 0
+            : leaderSpeed * ((minGap - CONFIG.SAFE_GAP) / 28);
+        targetSpeed = Math.min(targetSpeed, followTarget);
+      }
+
+      if (typeof tr.currentSpeed !== 'number') tr.currentSpeed = 0;
+      if (tr.currentSpeed < targetSpeed) {
+        tr.currentSpeed = Math.min(targetSpeed, tr.currentSpeed + CONFIG.TRAIN_ACCEL * simDt);
+      } else if (tr.currentSpeed > targetSpeed) {
+        tr.currentSpeed = Math.max(targetSpeed, tr.currentSpeed - CONFIG.TRAIN_DECEL * simDt);
+      }
+
+      let nextS = tr.s + tr.currentSpeed * simDt;
       if (leader && nextS > leader.s - CONFIG.SAFE_GAP) {
         nextS = Math.max(tr.s, leader.s - CONFIG.SAFE_GAP);
       }
+      if (nextS > total) {
+        nextS = total;
+      }
 
+      const stepDist = Math.max(0, nextS - tr.s);
       tr.s = nextS;
 
       if (tr.s >= total) {
@@ -926,6 +1254,7 @@ function stepTrains(state, simDt, hooks) {
         tr.corridorKey = null;
         tr.lane = 0;
         tr.lateralOffset = 0;
+        tr.currentSpeed = 0;
 
         if (!line || line.stations.length < 2) {
           reclaimTrainToInventory(state, tr.id);
@@ -941,12 +1270,30 @@ function stepTrains(state, simDt, hooks) {
         if (arrivedStation) {
           tr.x = arrivedStation.x;
           tr.y = arrivedStation.y;
+          recordTrainHistory(tr, tr.x, tr.y, tr.angle, stepDist);
           const did = handleStationExchange(state, tr, arrivedStation, hooks);
           if (did) tr.dwellTimer = CONFIG.TRAIN_DWELL_TIME;
           tr.exchangedAtStop = true;
         }
       } else {
         updateTrainPoseOnCorridor(state, tr, corridor);
+        recordTrainHistory(tr, tr.x, tr.y, tr.angle, stepDist);
+
+        tr.exhaustTimer = (tr.exhaustTimer ?? 0) - simDt;
+        if (tr.exhaustTimer <= 0) {
+          const interval = inHill ? 0.12 : tr.type === 'freight' ? 0.22 : 0.34;
+          tr.exhaustTimer = interval * (0.8 + state.rng() * 0.4);
+          const stackX = tr.x + Math.cos(tr.angle) * 6;
+          const stackY = tr.y + Math.sin(tr.angle) * 6;
+          spawnPuff(state, stackX, stackY, {
+            startR: inHill ? 3 : 2,
+            endR: inHill ? 11 : 8,
+            vx: -Math.cos(tr.angle) * 10,
+            vy: -16,
+            life: inHill ? 0.85 : 0.65,
+            color: inHill ? 'rgba(95, 90, 82, 0.55)' : 'rgba(225, 220, 210, 0.5)',
+          });
+        }
       }
     }
   }

@@ -18,11 +18,19 @@
       </div>
 
       <div class="hud-stats">
-        <div class="stat-chip" title="Deliveries completed">
+        <div class="stat-chip" title="Total passenger &amp; freight deliveries completed">
           <span class="stat-label">DELIVERED</span>
           <span id="hud-score" class="stat-value">0</span>
         </div>
-        <div class="stat-chip" title="Current week & day">
+        <div class="stat-chip" title="Manufactured Goods supplied to grow Hamlets into Towns &amp; Cities">
+          <span class="stat-label">GOODS</span>
+          <span id="hud-goods" class="stat-value">0</span>
+        </div>
+        <div class="stat-chip" title="Tier 3 Cities active on the network">
+          <span class="stat-label">CITIES</span>
+          <span id="hud-cities" class="stat-value">1</span>
+        </div>
+        <div class="stat-chip" title="Current week &amp; day">
           <span class="stat-label">WEEK <span id="hud-week">1</span></span>
           <span id="hud-day" class="stat-value">DAY 1</span>
         </div>
@@ -41,7 +49,7 @@
           <button id="btn-speed-2" class="speed-btn" data-speed="2" title="Fast Speed (2)">2×</button>
         </div>
         <button id="btn-mute" class="icon-btn" title="Toggle Sound (M)" aria-label="Toggle Sound">🔊</button>
-        <button id="btn-help" class="icon-btn" title="Quick Controls" aria-label="Quick Controls">?</button>
+        <button id="btn-help" class="icon-btn" title="Field Manual" aria-label="Field Manual">?</button>
       </div>
     </header>
 
@@ -52,27 +60,41 @@
     <footer id="bottom-dock" class="hud-panel">
       <div class="dock-section" id="dock-lines" aria-label="Rail Lines"></div>
       <div class="dock-divider"></div>
-      <div class="dock-section" id="dock-fleet" aria-label="Locomotives and Railcars">
-        <div class="dock-token" data-tool="express" draggable="false" title="Express Train (Fast passenger service)">
+      <div class="dock-section" id="dock-fleet" aria-label="Locomotives and Carriages">
+        <div class="dock-token" data-tool="express" draggable="false" title="Express Train (Locomotive + 2 coaches, fast passenger service)">
           <span class="token-icon token-express">
-            <svg viewBox="0 0 32 20" width="28" height="18"><path d="M2,15 L2,6 Q2,4 4,4 L22,4 L29,11 L29,15 Z" fill="#232629"/></svg>
+            <svg viewBox="0 0 44 20" width="38" height="18" aria-hidden="true">
+              <rect x="2" y="6" width="14" height="9" rx="1.5" fill="#232629"/>
+              <rect x="4.5" y="8.5" width="3.5" height="3" rx="0.5" fill="#FFFDF9"/>
+              <rect x="10" y="8.5" width="3.5" height="3" rx="0.5" fill="#FFFDF9"/>
+              <line x1="16" y1="11.5" x2="20" y2="11.5" stroke="#232629" stroke-width="2"/>
+              <path d="M20,15 L20,6 Q20,4 22,4 L34,4 L41,11 L41,15 Z" fill="#232629"/>
+              <path d="M24,7 L33,7 L36,10 L24,10 Z" fill="#FFFDF9" opacity="0.85"/>
+            </svg>
           </span>
           <span class="token-label">EXPRESS</span>
           <span class="token-badge" id="count-express">1</span>
         </div>
-        <div class="dock-token" data-tool="freight" draggable="false" title="Freight Train (Heavy cargo, minimal hill penalty)">
+        <div class="dock-token" data-tool="freight" draggable="false" title="Freight Train (Locomotive + 2 wagons, heavy cargo with minimal hill penalty)">
           <span class="token-icon token-freight">
-            <svg viewBox="0 0 32 20" width="28" height="18"><rect x="2" y="4" width="26" height="11" rx="2" fill="#5D473A"/><rect x="5" y="7" width="8" height="5" fill="#EDE5D5"/></svg>
+            <svg viewBox="0 0 44 20" width="38" height="18" aria-hidden="true">
+              <path d="M2,8 L2,15 L16,15 L16,8 L14,8 L14,12 L4,12 L4,8 Z" fill="#5D473A"/>
+              <rect x="5" y="6.5" width="4.5" height="5" rx="0.6" fill="#C05621"/>
+              <rect x="10" y="7.5" width="3.5" height="4" rx="0.6" fill="#D69E2E"/>
+              <line x1="16" y1="12" x2="20" y2="12" stroke="#5D473A" stroke-width="2"/>
+              <path d="M20,15 L20,7 L27,7 L27,4 L35,4 L35,8 L41,8 L41,15 Z" fill="#5D473A"/>
+              <rect x="29" y="6" width="4" height="3.5" rx="0.5" fill="#EDE5D5"/>
+            </svg>
           </span>
           <span class="token-label">FREIGHT</span>
           <span class="token-badge" id="count-freight">1</span>
         </div>
-        <div class="dock-token" data-tool="car" draggable="false" title="Extra Railcar (+4 capacity to any train)">
+        <div class="dock-token" data-tool="car" draggable="false" title="+3 capacity carriage, up to 4 per train">
           <span class="token-icon token-car">
-            <svg viewBox="0 0 32 20" width="28" height="18"><rect x="4" y="5" width="24" height="10" rx="2" fill="none" stroke="#232629" stroke-width="2.2"/><line x1="16" y1="5" x2="16" y2="15" stroke="#232629" stroke-width="1.5"/></svg>
+            <svg viewBox="0 0 32 20" width="28" height="18" aria-hidden="true"><rect x="4" y="5" width="24" height="10" rx="2" fill="none" stroke="#232629" stroke-width="2.2"/><line x1="16" y1="5" x2="16" y2="15" stroke="#232629" stroke-width="1.5"/></svg>
           </span>
-          <span class="token-label">CAR</span>
-          <span class="token-badge" id="count-car">0</span>
+          <span class="token-label">+CARRIAGE</span>
+          <span class="token-badge" id="count-car">1</span>
         </div>
       </div>
       <div class="dock-divider"></div>
@@ -84,7 +106,7 @@
           <span class="token-label">BRIDGE</span>
           <span class="token-badge" id="count-bridge">2</span>
         </div>
-        <div class="dock-token" data-tool="doubleTrack" title="Double-Track Kit (Drag onto a track segment for 2-way passing & overtaking)">
+        <div class="dock-token" data-tool="doubleTrack" title="Double-Track Kit (Drag onto a track segment for 2-way passing &amp; overtaking)">
           <span class="token-icon">
             <svg viewBox="0 0 28 20" width="24" height="18"><line x1="3" y1="7" x2="25" y2="7" stroke="#232629" stroke-width="2.2"/><line x1="3" y1="13" x2="25" y2="13" stroke="#232629" stroke-width="2.2"/></svg>
           </span>
@@ -134,12 +156,12 @@
             <span class="summary-label">Total Deliveries</span>
           </div>
           <div class="summary-stat">
-            <span class="summary-num" id="final-passengers">0</span>
-            <span class="summary-label">Passengers</span>
+            <span class="summary-num" id="final-goods">0</span>
+            <span class="summary-label">Goods Supplied</span>
           </div>
           <div class="summary-stat">
-            <span class="summary-num" id="final-cargo">0</span>
-            <span class="summary-label">Freight Cargo</span>
+            <span class="summary-num" id="final-grown">0</span>
+            <span class="summary-label">Towns Grown</span>
           </div>
         </div>
         <div class="modal-actions">
@@ -153,13 +175,13 @@
     <div id="help-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="help-title">
       <div class="modal-card help-card">
         <div class="modal-eyebrow">FIELD MANUAL</div>
-        <h2 id="help-title">Mini Rail Controls</h2>
+        <h2 id="help-title">Mini Rail Controls &amp; Supply Chain</h2>
         <ul class="help-list">
-          <li><strong>Build Tracks:</strong> Click &amp; drag from any station (or line T-bar end) to another station.</li>
-          <li><strong>Insert / Delete:</strong> Drag a segment onto a station to insert it; drag a T-bar back to its previous station (or right-click a segment) to remove.</li>
-          <li><strong>Trains &amp; Upgrades:</strong> Drag Express, Freight, Railcar, Double-Track, or Tunnel tokens from the bottom dock onto tracks or trains. Drag existing trains/upgrades to redeploy.</li>
-          <li><strong>Single-Track &amp; Terrain:</strong> Stations act as passing sidings. Crossing rivers uses a Bridge; hills slow Expresses (-40%) unless you add a Tunnel.</li>
-          <li><strong>Shapes:</strong> Villages (■) ↔ Cities (●) for Express; Resources (▲) → Ports (◆) for Freight.</li>
+          <li><strong>Build Tracks:</strong> Click &amp; drag from any station (or line T-bar end) to another station. New lines auto-dispatch an idle matching locomotive!</li>
+          <li><strong>Supply Chain &amp; Growth:</strong> Haul Raw Materials from <strong>Resource Sites</strong> (Forests/Mines) to <strong>Factories</strong> to craft <strong>Goods</strong>, then deliver Goods to <strong>Hamlets &amp; Towns</strong> to grow them into <strong>Cities</strong> (+1 bonus upgrade!).</li>
+          <li><strong>Passenger Service:</strong> <strong>Express</strong> trains carry Commuters (Towns &rarr; Cities), Local Travelers (Cities &rarr; Towns), and color-coded <strong>Intercity Tickets</strong> between Cities.</li>
+          <li><strong>Consists &amp; +Carriage:</strong> Every locomotive spawns with <strong>2 coupled carriages</strong> (6 capacity). Drag <strong>+Carriage</strong> onto any car of a train for +3 capacity (up to 4 carriages).</li>
+          <li><strong>Terrain &amp; Upgrades:</strong> Drag <strong>Double-Track</strong> or <strong>Tunnel</strong> tokens onto segments; river crossings auto-use <strong>Bridges</strong>. Right-click a train or segment to reclaim/remove.</li>
         </ul>
         <button id="btn-help-close" class="primary-btn">Back to Map</button>
       </div>

@@ -281,23 +281,96 @@ function generateHills(rng, river) {
   return hills;
 }
 
-function createStation(id, x, y, shape) {
-  const capacity = shape === 'circle' || shape === 'diamond' ? 8 : 6;
+function rectOverlapsStationPad(dx, dy, w, h, padRadius) {
+  const nearestX = Math.max(dx - w * 0.5, Math.min(0, dx + w * 0.5));
+  const nearestY = Math.max(dy - h * 0.5, Math.min(0, dy + h * 0.5));
+  return nearestX * nearestX + nearestY * nearestY < padRadius * padRadius;
+}
+
+function generateBuildingSeeds(rng) {
+  const seeds = [];
+  const padClearance = CONFIG.STATION_RADIUS + 4; // 20u >= STATION_RADIUS (16u)
+
+  for (let i = 0; i < 10; i++) {
+    let placed = null;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      // Bias slightly away from the bottom nameplate zone while keeping a natural cluster
+      const angle = rng() * Math.PI * 2;
+      const dist = padClearance + 7 + rng() * 14;
+      const w = 7 + Math.floor(rng() * 6); // 7..12
+      const h = 7 + Math.floor(rng() * 5); // 7..11
+      const dx = Math.round(Math.cos(angle) * dist);
+      const dy = Math.round(Math.sin(angle) * dist);
+
+      if (rectOverlapsStationPad(dx, dy, w, h, padClearance)) continue;
+      // Leave breathing room for bottom nameplate pill
+      if (dy > 14 && dy < 36 && Math.abs(dx) < 24) continue;
+
+      const tooClose = seeds.some((s) => Math.hypot(s.dx - dx, s.dy - dy) < 10);
+      if (tooClose) continue;
+
+      placed = { dx, dy, w, h, roof: Math.floor(rng() * 3) };
+      break;
+    }
+
+    if (!placed) {
+      const fallbackAngle = (i / 10) * Math.PI * 2 + 0.3;
+      const dist = padClearance + 12 + (i % 2) * 6;
+      placed = {
+        dx: Math.round(Math.cos(fallbackAngle) * dist),
+        dy: Math.round(Math.sin(fallbackAngle) * dist),
+        w: 8,
+        h: 8,
+        roof: i % 3,
+      };
+    }
+    seeds.push(placed);
+  }
+
+  return seeds;
+}
+
+function createStation(id, x, y, spec, rng) {
+  const { kind, subtype, name, tier = 1, cityCode = null, crestColor = null } = spec;
+
+  let capacity = 6;
+  let goodsTarget = null;
+  if (kind === 'settlement') {
+    const tierCfg = CONFIG.SETTLEMENT_TIERS[tier] || CONFIG.SETTLEMENT_TIERS[1];
+    capacity = tierCfg.capacity;
+    goodsTarget = tierCfg.goodsTarget;
+  } else if (kind === 'factory') {
+    capacity = 8;
+  } else if (kind === 'resource') {
+    capacity = 6;
+  }
+
   return {
     id,
     x,
     y,
-    shape, // 'square' | 'circle' | 'triangle' | 'diamond'
+    kind,
+    subtype,
+    name,
+    tier,
+    cityCode,
+    crestColor,
+    goodsProgress: 0,
+    goodsTarget,
+    buildingSeeds: kind === 'settlement' ? generateBuildingSeeds(rng) : [],
+    inputBuffer: 0,
+    processProgress: 0,
     capacity,
-    queue: [], // [{ targetShape, spawnedAt }]
+    queue: [],
     overflowTimer: 0,
     spawnTimer: 2.5 + (id % 3) * 1.1,
-    pulse: 1.0, // spawn pop animation
+    pulse: 0,
+    hoverScale: 1.0,
+    hoverVel: 0,
   };
 }
 
 function riverSideSign(river, x, y) {
-  // Approximate river y at x
   let closest = river.points[0];
   let bestDx = Infinity;
   for (const pt of river.points) {
@@ -317,6 +390,7 @@ export function generateWorld(state) {
   state.stations = [];
   state.stationById = new Map();
   state.pendingSpawns = [];
+  state.nextSpawnIndex = 0;
 
   const placed = [];
   const canPlace = (x, y, minDist) => {
@@ -324,38 +398,199 @@ export function generateWorld(state) {
     return placed.every((p) => Math.hypot(p.x - x, p.y - y) >= minDist);
   };
 
-  // Starter 4 nodes: 1 Village (square), 1 City (circle), 1 Resource (triangle), 1 Port (diamond)
-  const starterShapes = ['square', 'circle', 'triangle', 'diamond'];
-  const desiredSides = [1, -1, 1, -1];
-  for (let i = 0; i < starterShapes.length; i++) {
-    let sx = 0;
-    let sy = 0;
-    for (let attempt = 0; attempt < 80; attempt++) {
-      const x = (rng() * 2 - 1) * 390;
-      const y = (rng() * 2 - 1) * 230;
-      if (riverSideSign(state.river, x, y) !== desiredSides[i] && attempt < 55) continue;
-      if (canPlace(x, y, 175)) {
-        sx = x;
-        sy = y;
+  // --- Starter Valley Layout (4 readable landmarks inside initial zoom = 1.0 viewport) ---
+  // Station 1: Starter City (Grandhaven GH, Tier 3)
+  let s1Pos = null;
+  let s2Pos = null;
+  const starterSide = rng() > 0.5 ? 1 : -1;
+
+  for (let outer = 0; outer < 40 && !s2Pos; outer++) {
+    const c1x = (rng() * 2 - 1) * 350;
+    const c1y = (rng() * 2 - 1) * 195;
+    if (riverSideSign(state.river, c1x, c1y) !== starterSide) continue;
+    if (!canPlace(c1x, c1y, 175)) continue;
+
+    // Station 2: Starter Hamlet (Oakridge, Tier 1) on same river side, 200..310u from Station 1
+    for (let inner = 0; inner < 60; inner++) {
+      const ang = rng() * Math.PI * 2;
+      const dist = 205 + rng() * 100; // 205..305 units
+      const c2x = c1x + Math.cos(ang) * dist;
+      const c2y = c1y + Math.sin(ang) * dist;
+      if (Math.abs(c2x) > 405 || Math.abs(c2y) > 215) continue;
+      if (riverSideSign(state.river, c2x, c2y) !== starterSide) continue;
+      if (distanceToRiver(state.river, c2x, c2y) < state.river.halfWidth + 30) continue;
+      if (Math.hypot(c2x - c1x, c2y - c1y) < 200) continue;
+
+      const pts = buildOctilinearPoints(c1x, c1y, c2x, c2y, state.river, state.hills);
+      if (countRiverCrossings(pts, state.river) === 0) {
+        s1Pos = { x: c1x, y: c1y };
+        s2Pos = { x: c2x, y: c2y };
         break;
       }
     }
-    const st = createStation(i + 1, sx, sy, starterShapes[i]);
-    st.pulse = 0;
-    placed.push(st);
-    state.stations.push(st);
-    state.stationById.set(st.id, st);
   }
 
-  // Generate 18 progressive expansion nodes from inner-mid to outer valley
-  const expansionBag = [
-    'square', 'circle', 'square', 'triangle', 'circle', 'diamond',
-    'square', 'triangle', 'circle', 'square', 'diamond', 'circle',
-    'triangle', 'square', 'circle', 'diamond', 'square', 'circle',
+  // Fallback if river geometry made strict same-side search tight
+  if (!s1Pos || !s2Pos) {
+    s1Pos = s1Pos || { x: -160, y: starterSide * 130 };
+    s2Pos = { x: 95, y: starterSide * 135 };
+  }
+
+  const s1 = createStation(
+    1,
+    s1Pos.x,
+    s1Pos.y,
+    {
+      kind: 'settlement',
+      subtype: 'city',
+      name: CONFIG.SETTLEMENT_NAMES[0][0], // Grandhaven
+      tier: 3,
+      cityCode: CONFIG.SETTLEMENT_NAMES[0][1], // GH
+      crestColor: CONFIG.CITY_CREST_PALETTE[0],
+    },
+    rng
+  );
+  placed.push(s1);
+  state.stations.push(s1);
+  state.stationById.set(s1.id, s1);
+
+  const s2 = createStation(
+    2,
+    s2Pos.x,
+    s2Pos.y,
+    {
+      kind: 'settlement',
+      subtype: 'hamlet',
+      name: CONFIG.SETTLEMENT_NAMES[1][0], // Oakridge
+      tier: 1,
+    },
+    rng
+  );
+  placed.push(s2);
+  state.stations.push(s2);
+  state.stationById.set(s2.id, s2);
+
+  // Station 3: Starter Resource Site (Timber Camp, forest) on opposite side of river
+  let s3Pos = null;
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const x = (rng() * 2 - 1) * 390;
+    const y = (rng() * 2 - 1) * 210;
+    if (riverSideSign(state.river, x, y) === starterSide && attempt < 95) continue;
+    if (canPlace(x, y, 185)) {
+      s3Pos = { x, y };
+      break;
+    }
+  }
+  if (!s3Pos) {
+    s3Pos = { x: -240, y: -starterSide * 145 };
+  }
+
+  const s3 = createStation(
+    3,
+    s3Pos.x,
+    s3Pos.y,
+    {
+      kind: 'resource',
+      subtype: 'forest',
+      name: CONFIG.INDUSTRY_NAMES.forest[0], // Timber Camp
+    },
+    rng
+  );
+  placed.push(s3);
+  state.stations.push(s3);
+  state.stationById.set(s3.id, s3);
+
+  // Station 4: Starter Factory (Millworks) positioned between Timber Camp and Grandhaven/Oakridge
+  // Ensure at least one river or hill interaction across the freight corridor (3 -> 4 -> 1/2)
+  let s4Pos = null;
+  let bestScore = Infinity;
+  const midTargetX = (s3.x + (s1.x + s2.x) * 0.5) * 0.5;
+  const midTargetY = (s3.y + (s1.y + s2.y) * 0.5) * 0.5;
+
+  for (let attempt = 0; attempt < 140; attempt++) {
+    const x = (rng() * 2 - 1) * 395;
+    const y = (rng() * 2 - 1) * 210;
+    if (!canPlace(x, y, 175)) continue;
+
+    const legA = buildOctilinearPoints(s3.x, s3.y, x, y, state.river, state.hills);
+    const legB = buildOctilinearPoints(x, y, s1.x, s1.y, state.river, state.hills);
+    const lenA = computePolylineLengths(legA);
+    const lenB = computePolylineLengths(legB);
+    const crossings =
+      countRiverCrossings(legA, state.river) + countRiverCrossings(legB, state.river);
+    const hillHits =
+      computeHillIntervals(legA, lenA.cumLengths, lenA.totalLength, state.hills).length +
+      computeHillIntervals(legB, lenB.cumLengths, lenB.totalLength, state.hills).length;
+
+    if (crossings + hillHits === 0 && attempt < 100) continue;
+
+    const distToMid = Math.hypot(x - midTargetX, y - midTargetY);
+    const balancePenalty = Math.abs(lenA.totalLength - lenB.totalLength) * 0.35;
+    const score = distToMid + balancePenalty;
+    if (score < bestScore) {
+      bestScore = score;
+      s4Pos = { x, y };
+    }
+  }
+  if (!s4Pos) {
+    s4Pos = { x: 240, y: -starterSide * 140 };
+  }
+
+  const s4 = createStation(
+    4,
+    s4Pos.x,
+    s4Pos.y,
+    {
+      kind: 'factory',
+      subtype: 'factory',
+      name: CONFIG.INDUSTRY_NAMES.factory[0], // Millworks
+    },
+    rng
+  );
+  placed.push(s4);
+  state.stations.push(s4);
+  state.stationById.set(s4.id, s4);
+
+  if (state.onboarding) {
+    state.onboarding.starterIds = { cityId: 1, townId: 2, resourceId: 3, factoryId: 4 };
+    state.onboarding.freightLineBuilt = false;
+  }
+
+  // --- Progressive 18-Node Regional Expansion Schedule ---
+  // Spawn #5 is Northport (NP) City so Intercity Tickets activate smoothly mid-game.
+  const expansionSchedule = [
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #1
+    { kind: 'resource', subtype: 'mine' },               // #2
+    { kind: 'factory', subtype: 'factory' },             // #3
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #4
+    { kind: 'settlement', subtype: 'city', tier: 3 },   // #5 (Northport NP)
+    { kind: 'resource', subtype: 'forest' },             // #6
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #7
+    { kind: 'factory', subtype: 'factory' },             // #8
+    { kind: 'resource', subtype: 'mine' },               // #9
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #10
+    { kind: 'resource', subtype: 'forest' },             // #11
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #12
+    { kind: 'factory', subtype: 'factory' },             // #13
+    { kind: 'resource', subtype: 'mine' },               // #14
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #15
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #16
+    { kind: 'resource', subtype: 'forest' },             // #17
+    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #18
   ];
 
-  for (let i = 0; i < expansionBag.length; i++) {
-    const t = i / (expansionBag.length - 1);
+  // Track next unused name indices (starters claimed Grandhaven, Oakridge, Timber Camp, Millworks;
+  // Northport NP is reserved for the mid-game city at spawn #5)
+  const hamletPool = CONFIG.SETTLEMENT_NAMES.filter(
+    ([name]) => name !== 'Grandhaven' && name !== 'Oakridge' && name !== 'Northport'
+  );
+  let hamletIdx = 0;
+  let crestIdx = 1;
+  const industryIdx = { forest: 1, mine: 0, factory: 1 };
+
+  for (let i = 0; i < expansionSchedule.length; i++) {
+    const entry = expansionSchedule[i];
+    const t = i / (expansionSchedule.length - 1);
     const minRadius = 240 + t * 380;
     const maxRadius = 460 + t * 560;
     let chosen = null;
@@ -373,7 +608,33 @@ export function generateWorld(state) {
 
     if (chosen) {
       const id = placed.length + 1;
-      const st = createStation(id, chosen.x, chosen.y, expansionBag[i]);
+      let spec;
+      if (entry.kind === 'settlement') {
+        const isCity = entry.tier === 3;
+        const pair = isCity
+          ? CONFIG.SETTLEMENT_NAMES.find(([n]) => n === 'Northport') || ['Northport', 'NP']
+          : hamletPool[hamletIdx++ % hamletPool.length];
+        spec = {
+          kind: 'settlement',
+          subtype: entry.subtype,
+          name: pair[0],
+          tier: entry.tier,
+          cityCode: isCity ? pair[1] : null,
+          crestColor: isCity
+            ? CONFIG.CITY_CREST_PALETTE[crestIdx++ % CONFIG.CITY_CREST_PALETTE.length]
+            : null,
+        };
+      } else {
+        const pool = CONFIG.INDUSTRY_NAMES[entry.subtype];
+        const idx = industryIdx[entry.subtype]++;
+        spec = {
+          kind: entry.kind,
+          subtype: entry.subtype,
+          name: pool[idx % pool.length],
+        };
+      }
+
+      const st = createStation(id, chosen.x, chosen.y, spec, rng);
       placed.push(st);
       state.pendingSpawns.push(st);
     }

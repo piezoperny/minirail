@@ -37,13 +37,29 @@ function createAudioEngine(state) {
 
   return {
     unlock: () => ensureCtx(),
-    onDelivery(shape) {
-      const notes = { square: 523.25, circle: 659.25, triangle: 587.33, diamond: 440.0 };
-      playTone(notes[shape] || 523.25, 0.14, 0.035, 'sine');
+    onDelivery(kind) {
+      const notes = {
+        commuter: 523.25,
+        local: 587.33,
+        intercity: 659.25,
+        raw: 392.0,
+        goods: 440.0,
+        square: 523.25,
+        circle: 659.25,
+        triangle: 587.33,
+        diamond: 440.0,
+      };
+      playTone(notes[kind] || 523.25, 0.14, 0.035, 'sine');
     },
     onStationSpawn() {
       playTone(392.0, 0.18, 0.04, 'triangle', 0);
       playTone(523.25, 0.22, 0.04, 'triangle', 0.09);
+    },
+    onCityGrow() {
+      playTone(523.25, 0.22, 0.045, 'triangle', 0);
+      playTone(659.25, 0.24, 0.045, 'triangle', 0.075);
+      playTone(783.99, 0.26, 0.045, 'triangle', 0.15);
+      playTone(1046.5, 0.42, 0.055, 'sine', 0.225);
     },
     onWeekEnd() {
       playTone(440.0, 0.25, 0.045, 'sine', 0);
@@ -78,8 +94,8 @@ function buildDraftPackPool(state) {
     },
     {
       id: 'extraCars',
-      title: 'Extra Railcars',
-      desc: '+2 Railcars (+4 capacity each when attached to any locomotive).',
+      title: 'Extra Carriages',
+      desc: '+2 Extra Carriages (+3 capacity each, up to 4 carriages per train).',
       apply: () => {
         state.inventory.car += 2;
       },
@@ -112,6 +128,8 @@ export function setupUI(state, callbacks) {
 
   const dockLines = document.getElementById('dock-lines');
   const scoreEl = document.getElementById('hud-score');
+  const goodsEl = document.getElementById('hud-goods');
+  const citiesEl = document.getElementById('hud-cities');
   const weekEl = document.getElementById('hud-week');
   const dayEl = document.getElementById('hud-day');
   const dayRingEl = document.getElementById('day-ring-fg');
@@ -126,8 +144,8 @@ export function setupUI(state, callbacks) {
   const gameOverModal = document.getElementById('gameover-modal');
   const finalDaysEl = document.getElementById('final-days');
   const finalDelivEl = document.getElementById('final-deliveries');
-  const finalPassEl = document.getElementById('final-passengers');
-  const finalCargoEl = document.getElementById('final-cargo');
+  const finalGoodsEl = document.getElementById('final-goods');
+  const finalGrownEl = document.getElementById('final-grown');
   const gameOverReasonEl = document.getElementById('gameover-reason');
 
   const draftModal = document.getElementById('draft-modal');
@@ -162,12 +180,12 @@ export function setupUI(state, callbacks) {
       {
         id: 'express',
         title: 'Express Train',
-        desc: 'Fast (155 u/s) passenger locomotive. Slows -40% on untunneled hills.',
+        desc: 'Fast (155 u/s) passenger consist with 2 coaches (6 cap). Carries Commuters, Travelers & Intercity Tickets; slows -40% on untunneled hills.',
       },
       {
         id: 'freight',
         title: 'Freight Train',
-        desc: 'Heavy (100 u/s) cargo locomotive. Only -10% hill penalty.',
+        desc: 'Heavy (100 u/s) cargo consist with 2 wagons (6 cap). Hauls Raw Materials to Factories & Goods to growing Towns; only -10% hill penalty.',
       },
     ];
 
@@ -296,6 +314,10 @@ export function setupUI(state, callbacks) {
 
   function syncUI() {
     scoreEl.textContent = String(state.deliveriesTotal);
+    goodsEl.textContent = String(state.deliveriesGoods ?? 0);
+    citiesEl.textContent = String(
+      state.stations.filter((s) => s.kind === 'settlement' && s.tier === 3).length
+    );
     weekEl.textContent = String(state.week);
     dayEl.textContent = `DAY ${state.day}`;
 
@@ -344,8 +366,8 @@ export function setupUI(state, callbacks) {
     if (state.phase === 'gameover') {
       finalDaysEl.textContent = String(state.day);
       finalDelivEl.textContent = String(state.deliveriesTotal);
-      finalPassEl.textContent = String(state.deliveriesPassengers);
-      finalCargoEl.textContent = String(state.deliveriesCargo);
+      finalGoodsEl.textContent = String(state.deliveriesGoods ?? 0);
+      finalGrownEl.textContent = String(state.citiesGrown ?? 0);
       gameOverReasonEl.textContent = state.gameOverReason || 'Network overcrowded.';
       gameOverModal.classList.remove('hidden');
     } else {
@@ -357,8 +379,9 @@ export function setupUI(state, callbacks) {
   return {
     syncUI,
     hooks: {
-      onDelivery: (shape) => audio.onDelivery(shape),
+      onDelivery: (kind) => audio.onDelivery(kind),
       onStationSpawn: () => audio.onStationSpawn(),
+      onCityGrow: () => audio.onCityGrow(),
       onWeekEnd: () => {
         audio.onWeekEnd();
         syncUI();

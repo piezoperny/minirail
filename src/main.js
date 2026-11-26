@@ -1,6 +1,7 @@
 import { createInitialState, worldToScreen } from './state.js';
 import { generateWorld } from './mapGen.js';
-import { stepSimulation } from './simulation.js';
+import { initStarterLine, stepSimulation } from './simulation.js';
+import { stepFX } from './fx.js';
 import { renderGame } from './renderer.js';
 import { setupInput } from './input.js';
 import { setupUI } from './ui.js';
@@ -10,6 +11,7 @@ const ctx = canvas.getContext('2d');
 
 let state = createInitialState(133742);
 generateWorld(state);
+initStarterLine(state);
 
 function resizeCanvas() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -34,6 +36,7 @@ const ui = setupUI(state, {
     Object.assign(state, fresh);
     state.muted = prevMuted;
     generateWorld(state);
+    initStarterLine(state);
     resizeCanvas();
     ui.syncUI();
   },
@@ -52,7 +55,10 @@ window.__MINIRAIL__ = {
   getState: () => state,
   worldToScreen: (wx, wy) => worldToScreen(state, wx, wy),
   stepFixed: (steps = 1) => {
-    for (let i = 0; i < steps; i++) stepSimulation(state, FIXED_DT, ui.hooks);
+    for (let i = 0; i < steps; i++) {
+      stepSimulation(state, FIXED_DT, ui.hooks);
+      stepFX(state, FIXED_DT);
+    }
   },
 };
 let accumulator = 0;
@@ -65,6 +71,7 @@ function frame(now) {
 
   while (accumulator >= FIXED_DT) {
     stepSimulation(state, FIXED_DT, ui.hooks);
+    stepFX(state, FIXED_DT);
     accumulator -= FIXED_DT;
   }
 

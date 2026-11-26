@@ -1,4 +1,4 @@
-import { CONFIG, screenToWorld, showHint } from './state.js';
+import { CONFIG, sampleTrainCarriagePose, screenToWorld, showHint } from './state.js';
 import {
   applyCorridorUpgrade,
   attachCarToTrain,
@@ -11,6 +11,13 @@ import {
   reclaimTrainToInventory,
   removeSegmentFromLine,
 } from './simulation.js';
+
+function syncStationHoverTargets(state) {
+  const hoveredId = state.interaction.hoveredStationId;
+  for (const st of state.stations) {
+    st.hoverTarget = st.id === hoveredId ? 1.12 : 1.0;
+  }
+}
 
 function distToPolyline(points, wx, wy) {
   let minDist = Infinity;
@@ -52,6 +59,15 @@ export function hitTestTrain(state, wx, wy, radius = 22) {
     if (d < bestD) {
       bestD = d;
       best = tr;
+    }
+    const carCount = tr.cars || 0;
+    for (let c = 1; c <= carCount; c++) {
+      const pose = sampleTrainCarriagePose(tr, c * CONFIG.CAR_SPACING);
+      const dc = Math.hypot(pose.x - wx, pose.y - wy);
+      if (dc < bestD) {
+        bestD = dc;
+        best = tr;
+      }
     }
   }
   return best;
@@ -348,6 +364,7 @@ export function setupInput(canvas, state, callbacks) {
       const snap = hitTestStation(state, x, y, 30);
       drag.snapStationId = snap && snap.id !== drag.fromStationId ? snap.id : null;
       state.interaction.hoveredStationId = drag.snapStationId;
+      syncStationHoverTargets(state);
       canvas.style.cursor = 'grabbing';
       return;
     }
@@ -371,6 +388,7 @@ export function setupInput(canvas, state, callbacks) {
 
     state.interaction.hoveredTrainId = tr ? tr.id : null;
     state.interaction.hoveredStationId = st ? st.id : null;
+    syncStationHoverTargets(state);
     state.interaction.hoveredTBar = tbar;
     state.interaction.hoveredCorridorKey = corridor ? corridor.key : null;
 
@@ -384,6 +402,10 @@ export function setupInput(canvas, state, callbacks) {
 
     state.interaction.mode = 'idle';
     state.interaction.drag = null;
+    if (mode === 'buildLine' || mode === 'insertNode') {
+      state.interaction.hoveredStationId = null;
+      syncStationHoverTargets(state);
+    }
 
     if (state.phase !== 'playing') return;
     const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);

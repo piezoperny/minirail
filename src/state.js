@@ -1,3 +1,5 @@
+import { createFXState } from './fx.js';
+
 export const CONFIG = {
   WORLD_WIDTH: 2400,
   WORLD_HEIGHT: 1500,
@@ -16,7 +18,7 @@ export const CONFIG = {
   MAX_LINES: 6,
 
   LINE_SPACING: 8,
-  FILLET_RADIUS: 22,
+  FILLET_RADIUS: 28,
   STATION_RADIUS: 16,
   T_BAR_OFFSET: 28,
   MIN_STATION_SPACING: 150,
@@ -31,9 +33,48 @@ export const CONFIG = {
   EXPRESS_HILL_MULT: 0.60,
   FREIGHT_HILL_MULT: 0.90,
   TRAIN_DWELL_TIME: 0.75,
-  TRAIN_BASE_CAPACITY: 4,
-  CAR_CAPACITY_BONUS: 4,
-  MAX_CARS_PER_TRAIN: 2,
+  TRAIN_ACCEL: 220,
+  TRAIN_DECEL: 290,
+
+  TRAIN_DEFAULT_CARS: 2,
+  MAX_CARS_PER_TRAIN: 4,
+  CAR_CAPACITY: 3,
+  CAR_SPACING: 26,
+  // Legacy capacity constants preserved for intermediate module compatibility
+  TRAIN_BASE_CAPACITY: 0,
+  CAR_CAPACITY_BONUS: 3,
+
+  FACTORY_PROCESS_TIME: 3.5,
+  FACTORY_INPUT_MAX: 6,
+
+  SETTLEMENT_TIERS: {
+    1: { name: 'Hamlet', subtype: 'hamlet', capacity: 6, goodsTarget: 4 },
+    2: { name: 'Town', subtype: 'town', capacity: 8, goodsTarget: 6 },
+    3: { name: 'City', subtype: 'city', capacity: 10, goodsTarget: null },
+  },
+
+  CITY_CREST_PALETTE: ['#B83280', '#2B6CB0', '#2F855A', '#C05621', '#6B46C1', '#0987A0'],
+
+  SETTLEMENT_NAMES: [
+    ['Grandhaven', 'GH'],
+    ['Oakridge', 'OK'],
+    ['Millbrook', 'MB'],
+    ['Northport', 'NP'],
+    ['Ashford', 'AF'],
+    ['Riverbend', 'RB'],
+    ['Eastwick', 'EW'],
+    ['Pinehurst', 'PH'],
+    ['Stonebridge', 'SB'],
+    ['Fairview', 'FV'],
+    ['Clearwater', 'CW'],
+    ['Highgate', 'HG'],
+  ],
+
+  INDUSTRY_NAMES: {
+    forest: ['Timber Camp', 'Pine Logging', 'Cedar Woods', 'Redwood Mill'],
+    mine: ['Iron Ridge', 'Coal Hollow', 'Copper Quarry', 'Granite Pit'],
+    factory: ['Millworks', 'Valley Foundry', 'Steam Joinery', 'Ironworks'],
+  },
 
   MIN_HEADWAY: 52,
   SAFE_GAP: 36,
@@ -104,6 +145,8 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     deliveriesTotal: 0,
     deliveriesPassengers: 0,
     deliveriesCargo: 0,
+    deliveriesGoods: 0,
+    citiesGrown: 0,
 
     // Camera & Viewport
     viewport: { width: 1280, height: 780, dpr: 1 },
@@ -114,17 +157,18 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     hills: [], // [{ id, x, y, rx, ry, angle, rings }]
 
     // Graph & Network
-    stations: [], // { id, x, y, shape, capacity, queue, overflowTimer, spawnTimer, pulse }
+    stations: [],
     stationById: new Map(),
     pendingSpawns: [], // pre-generated future station schedule
     nextSpawnIndex: 0,
     spawnElapsed: 0,
     nextSpawnInterval: 18,
+    nextTokenId: 1,
 
     corridors: new Map(), // edgeKey -> corridor object
     lines,
     activeLineId: 0,
-    unlockedLines: 2,
+    unlockedLines: 3,
 
     // Fleet
     trains: [],
@@ -134,11 +178,20 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     inventory: {
       express: 1,
       freight: 1,
-      car: 0,
+      car: 1,
       bridge: 2,
       doubleTrack: 1,
       tunnel: 1,
     },
+
+    // Onboarding
+    onboarding: {
+      freightLineBuilt: false,
+      starterIds: { cityId: 1, townId: 2, resourceId: 3, factoryId: 4 },
+    },
+
+    // FX
+    fx: createFXState(),
 
     // Interactive State (used by input.js & renderer.js)
     interaction: {
@@ -153,6 +206,113 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
       hintTimer: 0,
       flashMessage: null, // { text, x, y, timer }
     },
+  };
+}
+
+const MAX_TRAIN_HISTORY_SPAN = CONFIG.MAX_CARS_PER_TRAIN * CONFIG.CAR_SPACING + 96;
+
+export function recordTrainHistory(train, x, y, angle, stepDist = 0) {
+  if (!train) return;
+  if (!Array.isArray(train.pathHistory)) {
+    train.pathHistory = [];
+  }
+  if (typeof train.totalTraveled !== 'number') {
+    train.totalTraveled = 0;
+  }
+
+  const distDelta = stepDist > 0 ? stepDist : 0;
+  if (train.pathHistory.length === 0) {
+    train.totalTraveled += distDelta;
+    train.pathHistory.push({ dist: train.totalTraveled, x, y, angle });
+    return;
+  }
+
+  if (distDelta <= 0) {
+    const last = train.pathHistory[train.pathHistory.length - 1];
+    last.x = x;
+    last.y = y;
+    last.angle = angle;
+    return;
+  }
+
+  train.totalTraveled += distDelta;
+  const last = train.pathHistory[train.pathHistory.length - 1];
+  if (train.totalTraveled - last.dist >= 2.0) {
+    train.pathHistory.push({ dist: train.totalTraveled, x, y, angle });
+  } else {
+    last.dist = train.totalTraveled;
+    last.x = x;
+    last.y = y;
+    last.angle = angle;
+  }
+
+  while (
+    train.pathHistory.length > 2 &&
+    train.pathHistory[1].dist < train.totalTraveled - MAX_TRAIN_HISTORY_SPAN
+  ) {
+    train.pathHistory.shift();
+  }
+}
+
+export function sampleTrainCarriagePose(train, backDistance) {
+  if (!train) {
+    return { x: 0, y: 0, angle: 0 };
+  }
+  const hist = train.pathHistory;
+  const baseAngle = train.angle || 0;
+  if (!Array.isArray(hist) || hist.length === 0) {
+    return {
+      x: (train.x || 0) - Math.cos(baseAngle) * backDistance,
+      y: (train.y || 0) - Math.sin(baseAngle) * backDistance,
+      angle: baseAngle,
+    };
+  }
+
+  const total = typeof train.totalTraveled === 'number'
+    ? train.totalTraveled
+    : hist[hist.length - 1].dist;
+  const targetDist = total - backDistance;
+
+  if (targetDist <= hist[0].dist) {
+    const first = hist[0];
+    const extra = first.dist - targetDist;
+    return {
+      x: first.x - Math.cos(first.angle) * extra,
+      y: first.y - Math.sin(first.angle) * extra,
+      angle: first.angle,
+    };
+  }
+
+  const last = hist[hist.length - 1];
+  if (targetDist >= last.dist) {
+    return { x: last.x, y: last.y, angle: last.angle };
+  }
+
+  // Binary search for segment [lo, lo + 1] containing targetDist
+  let lo = 0;
+  let hi = hist.length - 2;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (hist[mid].dist <= targetDist) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  const a = hist[lo];
+  const b = hist[lo + 1];
+  const span = b.dist - a.dist;
+  const t = span > 1e-6 ? (targetDist - a.dist) / span : 0;
+
+  let angleDiff = b.angle - a.angle;
+  while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+  while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    angle: a.angle + angleDiff * t,
   };
 }
 

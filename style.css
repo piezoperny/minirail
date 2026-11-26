@@ -480,6 +480,7 @@ body,
 }
 
 .help-card {
+  max-width: 520px;
   text-align: left;
 }
 
