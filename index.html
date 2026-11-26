@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Mini Rail</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <canvas id="game-canvas"></canvas>
+
+    <!-- Top HUD -->
+    <header id="top-hud" class="hud-panel">
+      <div class="hud-brand">
+        <span class="brand-mark"></span>
+        <span class="brand-title">MINI RAIL</span>
+      </div>
+
+      <div class="hud-stats">
+        <div class="stat-chip" title="Deliveries completed">
+          <span class="stat-label">DELIVERED</span>
+          <span id="hud-score" class="stat-value">0</span>
+        </div>
+        <div class="stat-chip" title="Current week & day">
+          <span class="stat-label">WEEK <span id="hud-week">1</span></span>
+          <span id="hud-day" class="stat-value">DAY 1</span>
+        </div>
+        <div class="day-progress-ring" title="Day progress">
+          <svg viewBox="0 0 36 36" width="28" height="28">
+            <circle class="ring-bg" cx="18" cy="18" r="14"></circle>
+            <circle id="day-ring-fg" class="ring-fg" cx="18" cy="18" r="14" stroke-dasharray="87.96" stroke-dashoffset="87.96"></circle>
+          </svg>
+        </div>
+      </div>
+
+      <div class="hud-controls">
+        <div class="speed-group" role="group" aria-label="Simulation speed">
+          <button id="btn-speed-0" class="speed-btn" data-speed="0" title="Pause (Space)">❚❚</button>
+          <button id="btn-speed-1" class="speed-btn active" data-speed="1" title="Normal Speed (1)">1×</button>
+          <button id="btn-speed-2" class="speed-btn" data-speed="2" title="Fast Speed (2)">2×</button>
+        </div>
+        <button id="btn-mute" class="icon-btn" title="Toggle Sound (M)" aria-label="Toggle Sound">🔊</button>
+        <button id="btn-help" class="icon-btn" title="Quick Controls" aria-label="Quick Controls">?</button>
+      </div>
+    </header>
+
+    <!-- Subtle Contextual Hint Toast -->
+    <div id="hint-banner" class="hint-banner hidden"></div>
+
+    <!-- Bottom Inventory Dock -->
+    <footer id="bottom-dock" class="hud-panel">
+      <div class="dock-section" id="dock-lines" aria-label="Rail Lines"></div>
+      <div class="dock-divider"></div>
+      <div class="dock-section" id="dock-fleet" aria-label="Locomotives and Railcars">
+        <div class="dock-token" data-tool="express" draggable="false" title="Express Train (Fast passenger service)">
+          <span class="token-icon token-express">
+            <svg viewBox="0 0 32 20" width="28" height="18"><path d="M2,15 L2,6 Q2,4 4,4 L22,4 L29,11 L29,15 Z" fill="#232629"/></svg>
+          </span>
+          <span class="token-label">EXPRESS</span>
+          <span class="token-badge" id="count-express">1</span>
+        </div>
+        <div class="dock-token" data-tool="freight" draggable="false" title="Freight Train (Heavy cargo, minimal hill penalty)">
+          <span class="token-icon token-freight">
+            <svg viewBox="0 0 32 20" width="28" height="18"><rect x="2" y="4" width="26" height="11" rx="2" fill="#5D473A"/><rect x="5" y="7" width="8" height="5" fill="#EDE5D5"/></svg>
+          </span>
+          <span class="token-label">FREIGHT</span>
+          <span class="token-badge" id="count-freight">1</span>
+        </div>
+        <div class="dock-token" data-tool="car" draggable="false" title="Extra Railcar (+4 capacity to any train)">
+          <span class="token-icon token-car">
+            <svg viewBox="0 0 32 20" width="28" height="18"><rect x="4" y="5" width="24" height="10" rx="2" fill="none" stroke="#232629" stroke-width="2.2"/><line x1="16" y1="5" x2="16" y2="15" stroke="#232629" stroke-width="1.5"/></svg>
+          </span>
+          <span class="token-label">CAR</span>
+          <span class="token-badge" id="count-car">0</span>
+        </div>
+      </div>
+      <div class="dock-divider"></div>
+      <div class="dock-section" id="dock-infra" aria-label="Infrastructure Upgrades">
+        <div class="dock-token static-token" data-tool="bridge" title="Bridges (Auto-used when crossing rivers)">
+          <span class="token-icon">
+            <svg viewBox="0 0 28 20" width="24" height="18"><path d="M2,15 Q14,4 26,15" fill="none" stroke="#2B6CB0" stroke-width="2.4"/><line x1="2" y1="15" x2="26" y2="15" stroke="#232629" stroke-width="2"/></svg>
+          </span>
+          <span class="token-label">BRIDGE</span>
+          <span class="token-badge" id="count-bridge">2</span>
+        </div>
+        <div class="dock-token" data-tool="doubleTrack" title="Double-Track Kit (Drag onto a track segment for 2-way passing & overtaking)">
+          <span class="token-icon">
+            <svg viewBox="0 0 28 20" width="24" height="18"><line x1="3" y1="7" x2="25" y2="7" stroke="#232629" stroke-width="2.2"/><line x1="3" y1="13" x2="25" y2="13" stroke="#232629" stroke-width="2.2"/></svg>
+          </span>
+          <span class="token-label">DOUBLE</span>
+          <span class="token-badge" id="count-doubleTrack">1</span>
+        </div>
+        <div class="dock-token" data-tool="tunnel" title="Tunnel (Drag onto a hill segment to eliminate slowdown)">
+          <span class="token-icon">
+            <svg viewBox="0 0 28 20" width="24" height="18"><path d="M5,16 L5,10 A9,9 0 0,1 23,10 L23,16" fill="none" stroke="#232629" stroke-width="2.4"/><line x1="2" y1="16" x2="26" y2="16" stroke="#8C7E6A" stroke-width="1.5"/></svg>
+          </span>
+          <span class="token-label">TUNNEL</span>
+          <span class="token-badge" id="count-tunnel">1</span>
+        </div>
+      </div>
+    </footer>
+
+    <!-- Weekly Draft Modal -->
+    <div id="draft-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="draft-title">
+      <div class="modal-card">
+        <div class="modal-eyebrow">END OF WEEK <span id="draft-week-num">1</span></div>
+        <h2 id="draft-title">Regional Rail Expansion</h2>
+        <p class="modal-subtitle">Select <strong>1 Locomotive</strong> and <strong>1 Infrastructure Pack</strong> to continue.</p>
+
+        <div class="draft-section-label">1. Choose a Locomotive</div>
+        <div id="draft-loco-choices" class="draft-grid"></div>
+
+        <div class="draft-section-label">2. Choose an Infrastructure Pack</div>
+        <div id="draft-pack-choices" class="draft-grid"></div>
+
+        <button id="btn-draft-confirm" class="primary-btn" disabled>Confirm &amp; Resume</button>
+      </div>
+    </div>
+
+    <!-- Game Over Modal -->
+    <div id="gameover-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="gameover-title">
+      <div class="modal-card">
+        <div class="modal-eyebrow danger-text">NETWORK OVERCROWDED</div>
+        <h2 id="gameover-title">Service Suspended</h2>
+        <p id="gameover-reason" class="modal-subtitle">A station platform exceeded capacity for too long.</p>
+        <div class="summary-grid">
+          <div class="summary-stat">
+            <span class="summary-num" id="final-days">0</span>
+            <span class="summary-label">Days Survived</span>
+          </div>
+          <div class="summary-stat">
+            <span class="summary-num" id="final-deliveries">0</span>
+            <span class="summary-label">Total Deliveries</span>
+          </div>
+          <div class="summary-stat">
+            <span class="summary-num" id="final-passengers">0</span>
+            <span class="summary-label">Passengers</span>
+          </div>
+          <div class="summary-stat">
+            <span class="summary-num" id="final-cargo">0</span>
+            <span class="summary-label">Freight Cargo</span>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-retry-seed" class="secondary-btn">Retry Same Map</button>
+          <button id="btn-new-map" class="primary-btn">New Map</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Help Overlay Modal -->
+    <div id="help-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="help-title">
+      <div class="modal-card help-card">
+        <div class="modal-eyebrow">FIELD MANUAL</div>
+        <h2 id="help-title">Mini Rail Controls</h2>
+        <ul class="help-list">
+          <li><strong>Build Tracks:</strong> Click &amp; drag from any station (or line T-bar end) to another station.</li>
+          <li><strong>Insert / Delete:</strong> Drag a segment onto a station to insert it; drag a T-bar back to its previous station (or right-click a segment) to remove.</li>
+          <li><strong>Trains &amp; Upgrades:</strong> Drag Express, Freight, Railcar, Double-Track, or Tunnel tokens from the bottom dock onto tracks or trains. Drag existing trains/upgrades to redeploy.</li>
+          <li><strong>Single-Track &amp; Terrain:</strong> Stations act as passing sidings. Crossing rivers uses a Bridge; hills slow Expresses (-40%) unless you add a Tunnel.</li>
+          <li><strong>Shapes:</strong> Villages (■) ↔ Cities (●) for Express; Resources (▲) → Ports (◆) for Freight.</li>
+        </ul>
+        <button id="btn-help-close" class="primary-btn">Back to Map</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
