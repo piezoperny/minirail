@@ -10,6 +10,16 @@ const canvas = document.getElementById('game-canvas');
 const ctx = canvas.getContext('2d');
 
 let state = createInitialState(133742);
+try {
+  const savedTheme = localStorage.getItem('minirail-theme');
+  if (savedTheme === 'night' || savedTheme === 'day') {
+    state.theme = savedTheme;
+  }
+} catch {
+  // ignore storage errors
+}
+document.documentElement.dataset.theme = state.theme;
+
 generateWorld(state);
 initStarterLine(state);
 
@@ -32,9 +42,12 @@ resizeCanvas();
 const ui = setupUI(state, {
   onRestart(newSeed) {
     const prevMuted = state.muted;
+    const prevTheme = state.theme;
     const fresh = createInitialState(newSeed);
     Object.assign(state, fresh);
     state.muted = prevMuted;
+    state.theme = prevTheme;
+    document.documentElement.dataset.theme = state.theme;
     generateWorld(state);
     initStarterLine(state);
     resizeCanvas();
@@ -50,6 +63,29 @@ setupInput(canvas, state, {
 
 const FIXED_DT = 1 / 60;
 
+function stepCamera(dt) {
+  const cam = state.camera;
+  const posAlpha = Math.min(1, dt * 8.5);
+  const dx = cam.targetX - cam.x;
+  if (Math.abs(dx) > 0.05) {
+    cam.x += dx * posAlpha;
+  } else {
+    cam.x = cam.targetX;
+  }
+  const dy = cam.targetY - cam.y;
+  if (Math.abs(dy) > 0.05) {
+    cam.y += dy * posAlpha;
+  } else {
+    cam.y = cam.targetY;
+  }
+  const dz = cam.targetZoom - cam.zoom;
+  if (Math.abs(dz) > 0.0005) {
+    cam.zoom += dz * Math.min(1, dt * 6.0);
+  } else {
+    cam.zoom = cam.targetZoom;
+  }
+}
+
 // Expose inspection & deterministic test helper for automated verification
 window.__MINIRAIL__ = {
   getState: () => state,
@@ -58,6 +94,7 @@ window.__MINIRAIL__ = {
     for (let i = 0; i < steps; i++) {
       stepSimulation(state, FIXED_DT, ui.hooks);
       stepFX(state, FIXED_DT);
+      stepCamera(FIXED_DT);
     }
   },
 };
@@ -75,6 +112,7 @@ function frame(now) {
     accumulator -= FIXED_DT;
   }
 
+  stepCamera(rawDt);
   renderGame(ctx, state);
   ui.syncUI();
   requestAnimationFrame(frame);

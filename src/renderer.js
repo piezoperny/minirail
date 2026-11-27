@@ -2,9 +2,20 @@ import {
   CONFIG,
   edgeKey,
   getEffectiveScale,
+  getLineColor,
+  getThemePalette,
   sampleTrainCarriagePose,
 } from './state.js';
-import { buildOctilinearPoints, countRiverCrossings } from './mapGen.js';
+import {
+  buildLineSpine,
+  buildOctilinearPoints,
+  computePolylineLengths,
+  computeStationQueueAngle,
+  countRiverCrossings,
+  extractSubPolyline,
+  getLineTBarPose,
+  samplePointAlongPolyline,
+} from './mapGen.js';
 
 function offsetPolyline(points, offset) {
   if (Math.abs(offset) < 0.01) return points;
@@ -24,7 +35,7 @@ function offsetPolyline(points, offset) {
 }
 
 function strokePolyline(ctx, points) {
-  if (points.length < 2) return;
+  if (!points || points.length < 2) return;
   ctx.beginPath();
   ctx.moveTo(points[0].x, points[0].y);
   for (let i = 1; i < points.length; i++) {
@@ -71,27 +82,8 @@ export function drawShape(ctx, shape, x, y, r, fill, stroke, lineWidth = 2.6) {
   ctx.restore();
 }
 
-function drawGrid(ctx) {
-  const step = 120;
-  ctx.save();
-  ctx.strokeStyle = CONFIG.COLORS.paperGrid;
-  ctx.lineWidth = 1;
-  for (let x = -1440; x <= 1440; x += step) {
-    ctx.beginPath();
-    ctx.moveTo(x, -900);
-    ctx.lineTo(x, 900);
-    ctx.stroke();
-  }
-  for (let y = -900; y <= 900; y += step) {
-    ctx.beginPath();
-    ctx.moveTo(-1440, y);
-    ctx.lineTo(1440, y);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
-function drawHills(ctx, hills) {
+function drawHills(ctx, hills, pal) {
+  if (!hills || hills.length === 0) return;
   ctx.save();
   for (const h of hills) {
     ctx.save();
@@ -102,10 +94,10 @@ function drawHills(ctx, hills) {
       const s = scales[i];
       ctx.beginPath();
       ctx.ellipse(0, 0, h.rx * s, h.ry * s, 0, 0, Math.PI * 2);
-      ctx.fillStyle = CONFIG.COLORS.hillFill;
+      ctx.fillStyle = pal.hillFill;
       ctx.fill();
-      ctx.strokeStyle = CONFIG.COLORS.hillStroke;
-      ctx.lineWidth = i === 0 ? 1.5 : 1.1;
+      ctx.strokeStyle = pal.hillStroke;
+      ctx.lineWidth = i === 0 ? 1.4 : 1.0;
       ctx.stroke();
     }
     ctx.restore();
@@ -113,212 +105,263 @@ function drawHills(ctx, hills) {
   ctx.restore();
 }
 
-function drawRiver(ctx, state) {
+function drawRiver(ctx, state, pal) {
   const river = state.river;
-  const pts = river.points;
-  if (pts.length < 2) return;
-  const ripplesOffset = state.fx?.ripplesOffset || 0;
+  const pts = river?.points;
+  if (!pts || pts.length < 2) return;
 
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
 
-  // Soft valley bank halo
-  ctx.strokeStyle = CONFIG.COLORS.riverHalo;
+  // Smooth bank halo
+  ctx.strokeStyle = pal.riverHalo;
   ctx.lineWidth = river.halfWidth * 2 + 12;
   strokePolyline(ctx, pts);
 
-  // Main river body
-  ctx.strokeStyle = CONFIG.COLORS.river;
+  // Clean flat river ribbon
+  ctx.strokeStyle = pal.river;
   ctx.lineWidth = river.halfWidth * 2;
   strokePolyline(ctx, pts);
-
-  // Subtle center sheen
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-  ctx.lineWidth = river.halfWidth * 0.45;
-  strokePolyline(ctx, pts);
-
-  // Animated drifting current ripples
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.38)';
-  ctx.lineWidth = 2.2;
-  ctx.setLineDash([16, 28]);
-  ctx.lineDashOffset = -ripplesOffset;
-  strokePolyline(ctx, pts);
-
-  const upperStream = offsetPolyline(pts, river.halfWidth * 0.36);
-  const lowerStream = offsetPolyline(pts, -river.halfWidth * 0.36);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
-  ctx.lineWidth = 1.6;
-  ctx.setLineDash([10, 34]);
-  ctx.lineDashOffset = -(ripplesOffset * 0.8 + 14);
-  strokePolyline(ctx, upperStream);
-  ctx.lineDashOffset = -(ripplesOffset * 0.65 + 26);
-  strokePolyline(ctx, lowerStream);
 
   ctx.restore();
 }
 
-function drawCorridors(ctx, state) {
-  const hoveredKey = state.interaction.hoveredCorridorKey;
+function getCorridorCumLengths(corridor) {
+  if (Array.isArray(corridor.cumLengths) && corridor.cumLengths.length === corridor.points.length) {
+    return corridor.cumLengths;
+  }
+  return computePolylineLengths(corridor.points).cumLengths;
+}
 
+function drawCorridors(ctx, state, pal) {
+  const hoveredKey = state.interaction.hoveredCorridorKey;
+  const spotlightId = state.interaction.spotlightLineId;
+  const hasSpotlight = spotlightId !== null && spotlightId !== undefined;
+  const isNight = state.theme === 'night';
+
+  // Pass 1: Water-only bridges, hill-only tunnels, and corridor hover highlights
   for (const corridor of state.corridors.values()) {
     const activeIds = Array.from(corridor.activeLineIds).sort((a, b) => a - b);
     if (activeIds.length === 0) continue;
 
     const isHovered = hoveredKey === corridor.key;
     const bundleWidth = (activeIds.length - 1) * CONFIG.LINE_SPACING + 12;
+    const cumLengths = getCorridorCumLengths(corridor);
 
-    // Bridge deck under-layer
-    if (corridor.hasBridge) {
-      ctx.save();
-      ctx.strokeStyle = CONFIG.COLORS.bridgeDeck;
-      ctx.lineWidth = bundleWidth + 8;
-      ctx.lineCap = 'butt';
-      ctx.lineJoin = 'round';
-      strokePolyline(ctx, corridor.points);
+    // Water-only bridges
+    if (corridor.hasBridge && Array.isArray(corridor.riverIntervals) && corridor.riverIntervals.length > 0) {
+      for (const iv of corridor.riverIntervals) {
+        const sub = extractSubPolyline(corridor.points, cumLengths, iv.start, iv.end);
+        if (sub.length < 2) continue;
+        ctx.save();
+        ctx.lineCap = 'butt';
+        ctx.lineJoin = 'round';
 
-      ctx.strokeStyle = '#EDE5D5';
-      ctx.lineWidth = bundleWidth + 2;
-      strokePolyline(ctx, corridor.points);
-      ctx.restore();
+        ctx.strokeStyle = pal.bridgeStroke;
+        ctx.lineWidth = bundleWidth + 8;
+        strokePolyline(ctx, sub);
+
+        ctx.strokeStyle = pal.bridgeDeck;
+        ctx.lineWidth = bundleWidth + 2;
+        strokePolyline(ctx, sub);
+        ctx.restore();
+      }
     }
 
-    // Subtle perpendicular wooden railway sleepers / cross-ties under every active corridor
-    ctx.save();
-    ctx.strokeStyle = corridor.isDoubleTrack
-      ? 'rgba(74, 59, 50, 0.32)'
-      : 'rgba(93, 71, 58, 0.24)';
-    ctx.lineWidth = bundleWidth + (corridor.isDoubleTrack ? 9 : 5);
-    ctx.lineCap = 'butt';
-    ctx.setLineDash([2, 8]);
-    strokePolyline(ctx, corridor.points);
-    ctx.restore();
-
-    // Tunnel bore indicator
-    if (corridor.hasTunnel) {
-      ctx.save();
-      ctx.strokeStyle = 'rgba(35, 38, 41, 0.34)';
-      ctx.lineWidth = bundleWidth + 10;
-      ctx.lineCap = 'round';
-      strokePolyline(ctx, corridor.points);
-      ctx.restore();
+    // Hill-only tunnel portal sleeves
+    if (corridor.hasTunnel && Array.isArray(corridor.hillIntervals) && corridor.hillIntervals.length > 0) {
+      for (const iv of corridor.hillIntervals) {
+        const sub = extractSubPolyline(corridor.points, cumLengths, iv.start, iv.end);
+        if (sub.length < 2) continue;
+        ctx.save();
+        ctx.strokeStyle = isNight ? 'rgba(241, 245, 249, 0.24)' : 'rgba(35, 38, 41, 0.28)';
+        ctx.lineWidth = bundleWidth + 8;
+        ctx.lineCap = 'butt';
+        ctx.lineJoin = 'round';
+        ctx.setLineDash([6, 5]);
+        strokePolyline(ctx, sub);
+        ctx.restore();
+      }
     }
 
     // Hover highlight
     if (isHovered) {
       ctx.save();
-      ctx.strokeStyle = 'rgba(35, 38, 41, 0.16)';
+      ctx.strokeStyle = isNight ? 'rgba(241, 245, 249, 0.16)' : 'rgba(35, 38, 41, 0.14)';
       ctx.lineWidth = bundleWidth + 10;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       strokePolyline(ctx, corridor.points);
       ctx.restore();
     }
+  }
 
-    // Draw each parallel colored line
-    const n = activeIds.length;
-    for (let i = 0; i < n; i++) {
-      const lineId = activeIds[i];
-      const line = state.lines[lineId];
-      const offset = (i - (n - 1) * 0.5) * CONFIG.LINE_SPACING;
-      const pts = offsetPolyline(corridor.points, offset);
-      const isRemoving = line.removingEdges.has(corridor.key);
+  // Pass 2: Smooth active transit lines (along spine when unshared, parallel offset when shared)
+  for (const line of state.lines) {
+    if (!line.stations || line.stations.length < 2) continue;
 
-      ctx.save();
-      ctx.strokeStyle = line.color;
-      ctx.lineWidth = corridor.isDoubleTrack ? 5.5 : 4.5;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      if (isRemoving) {
-        ctx.globalAlpha = 0.35;
-        ctx.setLineDash([8, 8]);
+    const lineColor = getLineColor(state, line.id);
+    const isDimmed = hasSpotlight && spotlightId !== line.id;
+    const baseAlpha = isDimmed ? 0.18 : 1.0;
+
+    const n = line.stations.length;
+    const legCount = line.isLoop ? n : n - 1;
+    let hasSharedOrRemoving = line.removingEdges && line.removingEdges.size > 0;
+    let hasAnyDoubleTrack = false;
+
+    if (!hasSharedOrRemoving) {
+      for (let i = 0; i < legCount; i++) {
+        const aId = line.stations[i];
+        const bId = line.stations[(i + 1) % n];
+        const corr = state.corridors.get(edgeKey(aId, bId));
+        if (!corr) continue;
+        if (corr.activeLineIds.size > 1) {
+          hasSharedOrRemoving = true;
+          break;
+        }
+        if (corr.isDoubleTrack) hasAnyDoubleTrack = true;
       }
-      strokePolyline(ctx, pts);
+    }
 
-      // Subtle center groove on double-track
-      if (corridor.isDoubleTrack && !isRemoving) {
-        ctx.strokeStyle = CONFIG.COLORS.paper;
-        ctx.lineWidth = 1.4;
+    if (!hasSharedOrRemoving) {
+      const spine = line.spine && line.spine.points?.length >= 2 ? line.spine : buildLineSpine(state, line);
+      if (spine && spine.points.length >= 2) {
+        ctx.save();
+        ctx.globalAlpha = baseAlpha;
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 4.8;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        strokePolyline(ctx, spine.points);
+        ctx.restore();
+      }
+
+      if (hasAnyDoubleTrack) {
+        for (let i = 0; i < legCount; i++) {
+          const aId = line.stations[i];
+          const bId = line.stations[(i + 1) % n];
+          const corr = state.corridors.get(edgeKey(aId, bId));
+          if (!corr || !corr.isDoubleTrack) continue;
+          ctx.save();
+          ctx.globalAlpha = baseAlpha;
+          ctx.strokeStyle = lineColor;
+          ctx.lineWidth = 5.6;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          strokePolyline(ctx, corr.points);
+
+          ctx.strokeStyle = pal.bg;
+          ctx.lineWidth = 1.4;
+          strokePolyline(ctx, corr.points);
+          ctx.restore();
+        }
+      }
+    } else {
+      for (let i = 0; i < legCount; i++) {
+        const aId = line.stations[i];
+        const bId = line.stations[(i + 1) % n];
+        const key = edgeKey(aId, bId);
+        const corr = state.corridors.get(key);
+        if (!corr || !corr.points || corr.points.length < 2) continue;
+
+        const activeIds = Array.from(corr.activeLineIds).sort((a, b) => a - b);
+        const idx = activeIds.indexOf(line.id);
+        const count = activeIds.length;
+        const offset = idx >= 0 && count > 1 ? (idx - (count - 1) * 0.5) * CONFIG.LINE_SPACING : 0;
+        const pts = offsetPolyline(corr.points, offset);
+        const isRemoving = line.removingEdges?.has(key);
+
+        ctx.save();
+        ctx.globalAlpha = isRemoving ? baseAlpha * 0.35 : baseAlpha;
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = corr.isDoubleTrack ? 5.6 : 4.8;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        if (isRemoving) {
+          ctx.setLineDash([8, 8]);
+        }
         strokePolyline(ctx, pts);
+
+        if (corr.isDoubleTrack && !isRemoving) {
+          ctx.strokeStyle = pal.bg;
+          ctx.lineWidth = 1.4;
+          strokePolyline(ctx, pts);
+        }
+        ctx.restore();
       }
-      ctx.restore();
     }
+  }
 
-    // Upgrade badges at corridor midpoint
-    if (corridor.isDoubleTrack || corridor.hasTunnel) {
-      const midPt = corridor.points[Math.floor(corridor.points.length / 2)];
-      ctx.save();
-      ctx.fillStyle = CONFIG.COLORS.ink;
-      ctx.strokeStyle = CONFIG.COLORS.stationFill;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(midPt.x, midPt.y, 8, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+  // Pass 3: Upgrade badges at corridor midpoint
+  for (const corridor of state.corridors.values()) {
+    if (corridor.activeLineIds.size === 0) continue;
+    if (!corridor.isDoubleTrack && !corridor.hasTunnel) continue;
 
-      ctx.fillStyle = '#FFFDF9';
-      ctx.font = 'bold 9px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      const label =
-        corridor.hasTunnel && corridor.isDoubleTrack
-          ? '2T'
-          : corridor.hasTunnel
-          ? 'T'
-          : '2×';
-      ctx.fillText(label, midPt.x, midPt.y + 0.5);
-      ctx.restore();
-    }
+    const midPt = corridor.points[Math.floor(corridor.points.length / 2)];
+    if (!midPt) continue;
+
+    ctx.save();
+    ctx.fillStyle = pal.ink;
+    ctx.strokeStyle = pal.stationFill;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(midPt.x, midPt.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = pal.stationFill;
+    ctx.font = 'bold 9px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const label =
+      corridor.hasTunnel && corridor.isDoubleTrack
+        ? '2T'
+        : corridor.hasTunnel
+        ? 'T'
+        : '2×';
+    ctx.fillText(label, midPt.x, midPt.y + 0.5);
+    ctx.restore();
   }
 }
 
-function drawTBars(ctx, state) {
+function drawTBars(ctx, state, pal) {
+  const spotlightId = state.interaction.spotlightLineId;
+  const hasSpotlight = spotlightId !== null && spotlightId !== undefined;
+
   for (const line of state.lines) {
-    if (line.stations.length < 2 || line.isLoop) continue;
-    const ends = [
-      { stationId: line.stations[0], neighborId: line.stations[1], end: 'start' },
-      {
-        stationId: line.stations[line.stations.length - 1],
-        neighborId: line.stations[line.stations.length - 2],
-        end: 'end',
-      },
-    ];
+    if (!line.stations || line.stations.length < 2 || line.isLoop) continue;
+    const lineColor = getLineColor(state, line.id);
+    const isDimmed = hasSpotlight && spotlightId !== line.id;
 
-    for (const item of ends) {
-      const st = state.stationById.get(item.stationId);
-      const nb = state.stationById.get(item.neighborId);
-      if (!st || !nb) continue;
-      const dx = st.x - nb.x;
-      const dy = st.y - nb.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const ux = dx / len;
-      const uy = dy / len;
-      const px = -uy;
-      const py = ux;
+    for (const end of ['start', 'end']) {
+      const pose = getLineTBarPose(state, line, end);
+      if (!pose) continue;
+      const st = state.stationById.get(pose.stationId);
+      if (!st) continue;
 
-      const tipX = st.x + ux * CONFIG.T_BAR_OFFSET;
-      const tipY = st.y + uy * CONFIG.T_BAR_OFFSET;
       const isHovered =
         state.interaction.hoveredTBar &&
         state.interaction.hoveredTBar.lineId === line.id &&
-        state.interaction.hoveredTBar.end === item.end;
+        state.interaction.hoveredTBar.end === end;
 
       ctx.save();
-      ctx.strokeStyle = line.color;
-      ctx.lineWidth = isHovered ? 6 : 4.5;
+      if (isDimmed) ctx.globalAlpha = 0.18;
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = isHovered ? 6 : 4.6;
       ctx.lineCap = 'round';
       ctx.beginPath();
       ctx.moveTo(st.x, st.y);
-      ctx.lineTo(tipX, tipY);
-      ctx.moveTo(tipX - px * 9, tipY - py * 9);
-      ctx.lineTo(tipX + px * 9, tipY + py * 9);
+      ctx.lineTo(pose.x, pose.y);
+      ctx.moveTo(pose.x - pose.px * 9, pose.y - pose.py * 9);
+      ctx.lineTo(pose.x + pose.px * 9, pose.y + pose.py * 9);
       ctx.stroke();
       ctx.restore();
     }
   }
 }
 
-function drawOnboardingGuide(ctx, state) {
+function drawOnboardingGuide(ctx, state, pal) {
   if (state.onboarding?.freightLineBuilt || state.week !== 1) return;
   const ids = state.onboarding?.starterIds;
   if (!ids) return;
@@ -330,439 +373,300 @@ function drawOnboardingGuide(ctx, state) {
 
   const leg1 = buildOctilinearPoints(resSt.x, resSt.y, facSt.x, facSt.y, state.river, state.hills);
   const leg2 = buildOctilinearPoints(facSt.x, facSt.y, citySt.x, citySt.y, state.river, state.hills);
-  const phase = (state.fx?.ripplesOffset || 0) * 0.7;
+  const combined = leg1.concat(leg2.slice(1));
+  if (combined.length < 2) return;
+
+  const { cumLengths, totalLength } = computePolylineLengths(combined);
+  if (totalLength <= 0) return;
+
+  const phase = ((state.fx?.onboardingPhase ?? 0) % 1 + 1) % 1;
+  const cursorPt = samplePointAlongPolyline(combined, cumLengths, phase * totalLength);
 
   ctx.save();
-  ctx.strokeStyle = 'rgba(192, 86, 33, 0.44)';
+  // Wordless animated ghost line
+  ctx.strokeStyle = state.theme === 'night' ? 'rgba(255, 90, 61, 0.36)' : 'rgba(217, 78, 52, 0.34)';
   ctx.lineWidth = 4;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.setLineDash([8, 8]);
-  ctx.lineDashOffset = -phase;
-  strokePolyline(ctx, leg1);
-  strokePolyline(ctx, leg2);
+  ctx.lineDashOffset = -phase * 48;
+  strokePolyline(ctx, combined);
+  ctx.setLineDash([]);
 
-  // Subtle directional arrowhead near factory entry
-  if (leg1.length >= 2) {
-    const pA = leg1[leg1.length - 2];
-    const pB = leg1[leg1.length - 1];
-    const ang = Math.atan2(pB.y - pA.y, pB.x - pA.x);
-    const ax = pB.x - Math.cos(ang) * 26;
-    const ay = pB.y - Math.sin(ang) * 26;
-    ctx.setLineDash([]);
-    ctx.fillStyle = 'rgba(192, 86, 33, 0.65)';
+  // Subtle origin pulse at Timber Camp at start of cycle
+  if (phase < 0.25) {
+    const pFrac = phase / 0.25;
+    ctx.globalAlpha = (1 - pFrac) * 0.6;
+    ctx.strokeStyle = pal.danger;
+    ctx.lineWidth = 2.4;
     ctx.beginPath();
-    ctx.moveTo(ax + Math.cos(ang) * 6, ay + Math.sin(ang) * 6);
-    ctx.lineTo(ax + Math.cos(ang + 2.4) * 6, ay + Math.sin(ang + 2.4) * 6);
-    ctx.lineTo(ax + Math.cos(ang - 2.4) * 6, ay + Math.sin(ang - 2.4) * 6);
-    ctx.closePath();
-    ctx.fill();
+    ctx.arc(resSt.x, resSt.y, CONFIG.STATION_RADIUS + 4 + pFrac * 14, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
-  // Floating instruction pill
-  const label = `Drag from ${resSt.name || 'Timber Camp'} → ${facSt.name || 'Millworks'} → ${citySt.name || 'Grandhaven'} to start Freight!`;
-  ctx.font = 'bold 11px sans-serif';
-  const textW = ctx.measureText(label).width;
-  const pillW = textW + 22;
-  const pillH = 24;
-  const midX = (resSt.x + facSt.x + citySt.x) / 3;
-  const midY = Math.min(resSt.y, facSt.y, citySt.y) - 34;
-
-  ctx.fillStyle = 'rgba(255, 253, 249, 0.94)';
-  ctx.strokeStyle = 'rgba(192, 86, 33, 0.65)';
-  ctx.lineWidth = 1.6;
+  // Gliding finger / circle pulse along Timber Camp -> Millworks -> Grandhaven
+  const pulseScale = 1 + Math.sin(phase * Math.PI * 6) * 0.12;
+  ctx.globalAlpha = 0.26;
+  ctx.fillStyle = pal.danger;
   ctx.beginPath();
-  ctx.roundRect(midX - pillW / 2, midY - pillH / 2, pillW, pillH, 12);
+  ctx.arc(cursorPt.x, cursorPt.y, 14 * pulseScale, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.globalAlpha = 0.95;
+  ctx.fillStyle = pal.stationFill;
+  ctx.strokeStyle = pal.danger;
+  ctx.lineWidth = 2.6;
+  ctx.beginPath();
+  ctx.arc(cursorPt.x, cursorPt.y, 7.5, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
-
-  ctx.fillStyle = '#8C3B14';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(label, midX, midY + 0.5);
   ctx.restore();
 }
 
-function drawNameplate(ctx, x, y, text, accentColor = null) {
-  if (!text) return;
-  ctx.save();
-  ctx.font = 'bold 10px sans-serif';
-  const w = ctx.measureText(text).width + (accentColor ? 18 : 14);
-  const h = 17;
+function drawMeeple(ctx, fill, stroke, lineWidth = 1.6) {
+  ctx.fillStyle = fill;
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = lineWidth;
+  ctx.lineJoin = 'round';
 
-  ctx.fillStyle = 'rgba(255, 253, 249, 0.92)';
-  ctx.strokeStyle = 'rgba(35, 38, 41, 0.24)';
-  ctx.lineWidth = 1.1;
+  // Chubby rounded body
   ctx.beginPath();
-  ctx.roundRect(x - w / 2, y - h / 2, w, h, 8.5);
+  ctx.roundRect(-5, -1.2, 10, 7.6, 3.6);
   ctx.fill();
   ctx.stroke();
 
-  if (accentColor) {
-    ctx.fillStyle = accentColor;
-    ctx.beginPath();
-    ctx.arc(x - w / 2 + 7, y, 3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  ctx.fillStyle = CONFIG.COLORS.ink;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, x + (accentColor ? 3 : 0), y + 0.5);
-  ctx.restore();
+  // Plump head
+  ctx.beginPath();
+  ctx.arc(0, -4.4, 3.2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
 }
 
-function drawTokenIcon(ctx, tok, x, y, scale = 1) {
+function drawTokenIcon(ctx, tok, x, y, scale = 1, pal = null) {
+  const theme = pal || getThemePalette(null);
   ctx.save();
   ctx.translate(x, y);
   ctx.scale(scale, scale);
 
   const kind = tok?.kind;
 
-  if (kind === 'commuter' || kind === 'local') {
-    // Clean person silhouette + dark city dot (commuter) or warm cottage dot (local)
-    ctx.fillStyle = CONFIG.COLORS.ink;
+  if (kind === 'goods') {
+    // Plump rounded Parcel Box (13x12, rx=3)
+    const w = 13;
+    const h = 12;
+    ctx.fillStyle = '#EAB308';
+    ctx.strokeStyle = theme.ink;
+    ctx.lineWidth = 1.6;
     ctx.beginPath();
-    ctx.arc(0, -2.5, 2.1, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.moveTo(-3.4, 4.2);
-    ctx.quadraticCurveTo(-3.4, 0.2, 0, 0.2);
-    ctx.quadraticCurveTo(3.4, 0.2, 3.4, 4.2);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.fillStyle = kind === 'commuter' ? '#232629' : '#D97706';
-    ctx.strokeStyle = '#FFFDF9';
-    ctx.lineWidth = 0.9;
-    ctx.beginPath();
-    ctx.arc(3.4, -2.8, 2.1, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-  } else if (kind === 'intercity') {
-    // Rounded colored ticket pill in tok.crestColor with white cityCode
-    const code = tok.cityCode || 'IC';
-    const w = code.length > 2 ? 18 : 15;
-    const h = 11;
-    ctx.fillStyle = tok.crestColor || '#2B6CB0';
-    ctx.strokeStyle = '#FFFDF9';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(-w / 2, -h / 2, w, h, 4);
+    ctx.roundRect(-w / 2, -h / 2, w, h, 3);
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = '#FFFDF9';
-    ctx.font = 'bold 7px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(code, 0, 0.6);
+    // Crisp cream parcel tape cross
+    ctx.strokeStyle = '#FFFBEB';
+    ctx.lineWidth = 1.7;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, -h / 2 + 2);
+    ctx.lineTo(0, h / 2 - 2);
+    ctx.moveTo(-w / 2 + 2, 0);
+    ctx.lineTo(w / 2 - 2, 0);
+    ctx.stroke();
   } else if (kind === 'raw') {
-    // Warm rust/amber raw-material log/ingot icon
-    ctx.fillStyle = '#C05621';
-    ctx.strokeStyle = '#5D473A';
-    ctx.lineWidth = 1;
+    // Plump rounded Timber/Ingot Cylinder (14x10, rx=4.5)
+    const w = 14;
+    const h = 10;
+    ctx.fillStyle = '#C2410C';
+    ctx.strokeStyle = theme.ink;
+    ctx.lineWidth = 1.6;
     ctx.beginPath();
-    ctx.roundRect(-4.5, -3.2, 9, 6.4, 2);
+    ctx.roundRect(-w / 2, -h / 2, w, h, 4.5);
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = '#F6AD55';
+    // Bright circular end-grain cap
+    ctx.fillStyle = '#FDBA74';
     ctx.beginPath();
-    ctx.arc(2.6, 0, 1.8, 0, Math.PI * 2);
+    ctx.arc(3.2, 0, 2.7, 0, Math.PI * 2);
     ctx.fill();
-  } else if (kind === 'goods') {
-    // Crisp stenciled crate box (#2B6CB0 / #5D473A banded crate)
-    ctx.fillStyle = '#2B6CB0';
-    ctx.strokeStyle = '#5D473A';
-    ctx.lineWidth = 1.1;
+  } else if (kind === 'commuter') {
+    // Plump rounded Meeple in pal.ink with crisp contrast outline
+    drawMeeple(ctx, theme.ink, theme.stationFill, 1.5);
+  } else if (kind === 'local') {
+    // Plump rounded Meeple in #EA580C with crisp white inner dot
+    drawMeeple(ctx, '#EA580C', theme.stationFill, 1.5);
+    ctx.fillStyle = '#FFFFFF';
     ctx.beginPath();
-    ctx.roundRect(-4.3, -4.3, 8.6, 8.6, 1.5);
+    ctx.arc(0, 2.5, 1.7, 0, Math.PI * 2);
     ctx.fill();
-    ctx.stroke();
-
-    ctx.strokeStyle = '#EBF8FF';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(-3.2, -3.2);
-    ctx.lineTo(3.2, 3.2);
-    ctx.moveTo(-3.2, 3.2);
-    ctx.lineTo(3.2, -3.2);
-    ctx.stroke();
+  } else if (kind === 'intercity') {
+    // Plump rounded Meeple in tok.crestColor with crisp white outline
+    drawMeeple(ctx, tok.crestColor || '#2563EB', '#FFFFFF', 1.6);
   } else {
-    drawShape(ctx, tok?.targetShape || 'circle', 0, 0, 3.8, CONFIG.COLORS.ink, null, 1);
+    drawShape(ctx, tok?.targetShape || 'circle', 0, 0, 4.5, theme.ink, null, 1);
   }
 
   ctx.restore();
 }
 
-function drawSettlementLandmark(ctx, st, r) {
-  const tier = st.tier || (st.subtype === 'city' ? 3 : st.subtype === 'town' ? 2 : 1);
-  const tierCount = tier >= 3 ? 10 : tier === 2 ? 6 : 3;
-  const seeds = Array.isArray(st.buildingSeeds) ? st.buildingSeeds.slice(0, tierCount) : [];
-  const roofColors = ['#C05621', '#64748B', '#B7791F', '#8C5A3C'];
-
-  // Architectural building cluster framing the station pad
-  for (let i = 0; i < seeds.length; i++) {
-    const b = seeds[i];
-    const bx = st.x + b.dx;
-    const by = st.y + b.dy;
-    const bw = b.w || 9;
-    const bh = b.h || 8;
-    const roofColor = roofColors[(b.roof || i) % roofColors.length];
-
-    ctx.save();
-    ctx.fillStyle = '#EFE9DC';
-    ctx.strokeStyle = 'rgba(35, 38, 41, 0.42)';
-    ctx.lineWidth = 1;
-    ctx.fillRect(bx - bw / 2, by - bh / 2, bw, bh);
-    ctx.strokeRect(bx - bw / 2, by - bh / 2, bw, bh);
-
-    // Pitched roof cap
-    ctx.fillStyle = roofColor;
-    ctx.beginPath();
-    ctx.moveTo(bx - bw / 2 - 1, by - bh / 2);
-    ctx.lineTo(bx, by - bh / 2 - 4);
-    ctx.lineTo(bx + bw / 2 + 1, by - bh / 2);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
+function drawRoundedTriangle(ctx, x, y, r) {
+  const pts = [];
+  for (let i = 0; i < 3; i++) {
+    const ang = -Math.PI / 2 + (i * Math.PI * 2) / 3;
+    pts.push({ x: x + Math.cos(ang) * r, y: y + Math.sin(ang) * r });
   }
-
-  // Central crisp station hub
-  ctx.save();
-  if (tier >= 3) {
-    const hubR = r * 1.12;
-    const crest = st.crestColor || '#2B6CB0';
-    ctx.fillStyle = CONFIG.COLORS.stationFill;
-    ctx.strokeStyle = CONFIG.COLORS.ink;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.arc(st.x, st.y, hubR, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = crest;
-    ctx.beginPath();
-    ctx.arc(st.x, st.y, hubR - 4.5, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = '#FFFDF9';
-    ctx.font = 'bold 10px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(st.cityCode || 'CT', st.x, st.y + 0.5);
-  } else if (tier === 2) {
-    const s = r * 0.94;
-    ctx.fillStyle = CONFIG.COLORS.stationFill;
-    ctx.strokeStyle = CONFIG.COLORS.ink;
-    ctx.lineWidth = 2.8;
-    ctx.beginPath();
-    ctx.roundRect(st.x - s, st.y - s, s * 2, s * 2, 6);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.strokeStyle = '#B7791F';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.roundRect(st.x - s + 4, st.y - s + 4, (s - 4) * 2, (s - 4) * 2, 3.5);
-    ctx.stroke();
-  } else {
-    const hubR = r * 0.88;
-    ctx.fillStyle = CONFIG.COLORS.stationFill;
-    ctx.strokeStyle = CONFIG.COLORS.ink;
-    ctx.lineWidth = 2.6;
-    ctx.beginPath();
-    ctx.arc(st.x, st.y, hubR, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = '#C05621';
-    ctx.beginPath();
-    ctx.arc(st.x, st.y, 4, 0, Math.PI * 2);
-    ctx.fill();
+  const cr = 0.18;
+  ctx.beginPath();
+  for (let i = 0; i < 3; i++) {
+    const pPrev = pts[(i + 2) % 3];
+    const pCurr = pts[i];
+    const pNext = pts[(i + 1) % 3];
+    const aX = pCurr.x + (pPrev.x - pCurr.x) * cr;
+    const aY = pCurr.y + (pPrev.y - pCurr.y) * cr;
+    const bX = pCurr.x + (pNext.x - pCurr.x) * cr;
+    const bY = pCurr.y + (pNext.y - pCurr.y) * cr;
+    if (i === 0) ctx.moveTo(aX, aY);
+    else ctx.lineTo(aX, aY);
+    ctx.quadraticCurveTo(pCurr.x, pCurr.y, bX, bY);
   }
-  ctx.restore();
+  ctx.closePath();
+}
 
-  // Nameplate pill
-  const labelY = st.y + r + 14;
-  drawNameplate(ctx, st.x, labelY, st.name, tier >= 3 ? st.crestColor : null);
+function drawRimProgress(ctx, st, r, pal, isNight) {
+  const rimR = r + (st.isInterchange ? 7.5 : 4.5);
 
-  // Compact Goods progress pips for growing Hamlet / Town
-  if (typeof st.goodsTarget === 'number' && st.goodsTarget > 0) {
+  // Hamlet / Town segmented amber/gold goodsProgress arc
+  if (st.kind === 'settlement' && typeof st.goodsTarget === 'number' && st.goodsTarget > 0) {
     const total = st.goodsTarget;
     const filled = Math.min(total, st.goodsProgress || 0);
-    const pipSize = 5;
-    const gap = 2.5;
-    const rowW = total * pipSize + (total - 1) * gap;
-    const startX = st.x - rowW / 2;
-    const pipY = labelY + 11;
+    const gap = 0.16;
+    const segSpan = (Math.PI * 2 - total * gap) / total;
+    const startBase = -Math.PI / 2 + gap * 0.5;
 
     ctx.save();
+    ctx.lineWidth = 3.0;
+    ctx.lineCap = 'round';
     for (let i = 0; i < total; i++) {
-      const px = startX + i * (pipSize + gap);
-      ctx.fillStyle = i < filled ? '#2B6CB0' : 'rgba(255, 253, 249, 0.9)';
-      ctx.strokeStyle = i < filled ? '#1A365D' : 'rgba(35, 38, 41, 0.38)';
-      ctx.lineWidth = 1;
+      const a0 = startBase + i * (segSpan + gap);
+      const a1 = a0 + segSpan;
       ctx.beginPath();
-      ctx.roundRect(px, pipY, pipSize, pipSize, 1.2);
-      ctx.fill();
+      ctx.arc(st.x, st.y, rimR, a0, a1);
+      ctx.strokeStyle =
+        i < filled
+          ? isNight
+            ? '#FACC15'
+            : '#D97706'
+          : isNight
+          ? 'rgba(148, 163, 184, 0.22)'
+          : 'rgba(110, 106, 97, 0.22)';
       ctx.stroke();
     }
     ctx.restore();
   }
-}
 
-function drawResourceLandmark(ctx, st, r) {
-  const isMine = st.subtype === 'mine';
+  // Factory segmented terracotta input dots + smooth radial conversion arc
+  if (st.kind === 'factory') {
+    const maxInput = CONFIG.FACTORY_INPUT_MAX || 6;
+    const filledInput = Math.min(maxInput, st.inputBuffer || 0);
+    const frac = Math.max(0, Math.min(1, st.processProgress || 0));
 
-  // Station pad
-  ctx.save();
-  ctx.fillStyle = isMine ? '#EDE7DA' : '#EFF4EA';
-  ctx.strokeStyle = isMine ? '#4A5568' : '#2F855A';
-  ctx.lineWidth = 2.6;
-  ctx.beginPath();
-  ctx.arc(st.x, st.y, r * 0.98, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.stroke();
-
-  if (isMine) {
-    // Twin mountain + mine portal silhouette
-    ctx.fillStyle = '#64748B';
-    ctx.beginPath();
-    ctx.moveTo(st.x - 11, st.y + 7);
-    ctx.lineTo(st.x - 3, st.y - 8);
-    ctx.lineTo(st.x + 4, st.y + 7);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.fillStyle = '#475569';
-    ctx.beginPath();
-    ctx.moveTo(st.x - 1, st.y + 7);
-    ctx.lineTo(st.x + 6, st.y - 6);
-    ctx.lineTo(st.x + 12, st.y + 7);
-    ctx.closePath();
-    ctx.fill();
-
-    // Mine portal arch
-    ctx.fillStyle = '#232629';
-    ctx.beginPath();
-    ctx.arc(st.x + 1, st.y + 7, 3.8, Math.PI, 0);
-    ctx.fill();
-  } else {
-    // Stylized pine trio
-    const trees = [
-      { dx: -6, dy: 2, s: 0.82, col: '#276749' },
-      { dx: 6, dy: 2, s: 0.82, col: '#276749' },
-      { dx: 0, dy: -1, s: 1.05, col: '#2F855A' },
-    ];
-    for (const t of trees) {
-      const tx = st.x + t.dx;
-      const ty = st.y + t.dy;
-      ctx.fillStyle = '#5D473A';
-      ctx.fillRect(tx - 1, ty + 3 * t.s, 2, 4 * t.s);
-
-      ctx.fillStyle = t.col;
+    ctx.save();
+    // Smooth conversion progress arc
+    if (frac > 0.01) {
       ctx.beginPath();
-      ctx.moveTo(tx, ty - 9 * t.s);
-      ctx.lineTo(tx + 5.5 * t.s, ty + 3.5 * t.s);
-      ctx.lineTo(tx - 5.5 * t.s, ty + 3.5 * t.s);
-      ctx.closePath();
-      ctx.fill();
+      ctx.arc(st.x, st.y, rimR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
+      ctx.strokeStyle = isNight ? '#FACC15' : '#D97706';
+      ctx.lineWidth = 2.8;
+      ctx.lineCap = 'round';
+      ctx.stroke();
     }
-  }
-  ctx.restore();
 
-  drawNameplate(ctx, st.x, st.y + r + 14, st.name, isMine ? '#64748B' : '#2F855A');
+    // Segmented terracotta input dots around upper arc
+    const dotSpread = Math.PI * 0.9;
+    const dotStart = -Math.PI / 2 - dotSpread * 0.5;
+    for (let i = 0; i < maxInput; i++) {
+      const ang = dotStart + (i / (maxInput - 1)) * dotSpread;
+      const dx = st.x + Math.cos(ang) * (rimR + 4.5);
+      const dy = st.y + Math.sin(ang) * (rimR + 4.5);
+      ctx.beginPath();
+      ctx.arc(dx, dy, 2.3, 0, Math.PI * 2);
+      ctx.fillStyle =
+        i < filledInput
+          ? '#EA580C'
+          : isNight
+          ? 'rgba(148, 163, 184, 0.28)'
+          : 'rgba(110, 106, 97, 0.25)';
+      ctx.fill();
+      if (i < filledInput) {
+        ctx.strokeStyle = pal.stationFill;
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
 }
 
-function drawFactoryLandmark(ctx, st, r) {
-  ctx.save();
-  const s = r * 1.04;
+function getStationSubtitle(st) {
+  if (st.kind === 'settlement') {
+    const tier = st.tier || (st.subtype === 'city' ? 3 : st.subtype === 'town' ? 2 : 1);
+    if (tier >= 3) return 'City';
+    const role = tier === 2 ? 'Town' : 'Hamlet';
+    if (typeof st.goodsTarget === 'number' && st.goodsTarget > 0) {
+      return `${role} · ${st.goodsProgress || 0}/${st.goodsTarget} Goods`;
+    }
+    return role;
+  }
+  if (st.kind === 'resource') {
+    return st.subtype === 'mine' ? 'Mine' : 'Forest';
+  }
+  if (st.kind === 'factory') {
+    return 'Factory';
+  }
+  return '';
+}
 
-  // Industrial pad
-  ctx.fillStyle = '#EFE9DC';
-  ctx.strokeStyle = '#5D473A';
-  ctx.lineWidth = 2.8;
+function drawHoverLabel(ctx, st, r, pal, isNight) {
+  const title = st.name || '';
+  if (!title) return;
+  const sub = getStationSubtitle(st);
+
+  ctx.save();
+  ctx.font = 'bold 10.5px sans-serif';
+  const titleW = ctx.measureText(title).width;
+  ctx.font = '600 8.5px sans-serif';
+  const subW = sub ? ctx.measureText(sub).width : 0;
+  const w = Math.max(titleW, subW) + 18;
+  const h = sub ? 27 : 18;
+  const x = st.x;
+  const y = st.y + r + 22;
+
+  ctx.fillStyle = pal.stationFill;
+  ctx.strokeStyle = isNight ? 'rgba(241, 245, 249, 0.25)' : 'rgba(35, 38, 41, 0.22)';
+  ctx.lineWidth = 1.2;
   ctx.beginPath();
-  ctx.roundRect(st.x - s, st.y - s, s * 2, s * 2, 5);
+  ctx.roundRect(x - w / 2, y - h / 2, w, h, 8);
   ctx.fill();
   ctx.stroke();
 
-  // Twin smokestacks
-  ctx.fillStyle = '#4A5568';
-  ctx.fillRect(st.x - 8, st.y - 12, 3.5, 9);
-  ctx.fillRect(st.x - 2, st.y - 12, 3.5, 9);
-
-  // Sawtooth industrial roof
-  ctx.fillStyle = '#9C4221';
-  ctx.beginPath();
-  ctx.moveTo(st.x - 10, st.y + 6);
-  ctx.lineTo(st.x - 10, st.y - 4);
-  ctx.lineTo(st.x - 3, st.y + 1);
-  ctx.lineTo(st.x - 3, st.y - 4);
-  ctx.lineTo(st.x + 4, st.y + 1);
-  ctx.lineTo(st.x + 4, st.y - 4);
-  ctx.lineTo(st.x + 10, st.y + 1);
-  ctx.lineTo(st.x + 10, st.y + 6);
-  ctx.closePath();
-  ctx.fill();
-
-  // Animated processProgress bar on factory fascia
-  if ((st.processProgress || 0) > 0) {
-    const barW = 18;
-    const frac = Math.max(0, Math.min(1, st.processProgress));
-    ctx.fillStyle = 'rgba(35, 38, 41, 0.25)';
-    ctx.fillRect(st.x - barW / 2, st.y + 7.5, barW, 3);
-    ctx.fillStyle = '#D69E2E';
-    ctx.fillRect(st.x - barW / 2, st.y + 7.5, barW * frac, 3);
-  }
-
-  // inputBuffer raw-material pips along top of pad
-  const maxInput = CONFIG.FACTORY_INPUT_MAX || 6;
-  const filledInput = Math.min(maxInput, st.inputBuffer || 0);
-  const pipSize = 3.5;
-  const gap = 1.5;
-  const rowW = maxInput * pipSize + (maxInput - 1) * gap;
-  const startX = st.x - rowW / 2;
-  for (let i = 0; i < maxInput; i++) {
-    const px = startX + i * (pipSize + gap);
-    ctx.fillStyle = i < filledInput ? '#C05621' : 'rgba(255, 253, 249, 0.85)';
-    ctx.strokeStyle = i < filledInput ? '#7B341E' : 'rgba(35, 38, 41, 0.32)';
-    ctx.lineWidth = 0.8;
-    ctx.fillRect(px, st.y - s - 6, pipSize, pipSize);
-    ctx.strokeRect(px, st.y - s - 6, pipSize, pipSize);
-  }
-  ctx.restore();
-
-  const labelY = st.y + r + 14;
-  drawNameplate(ctx, st.x, labelY, st.name, '#C05621');
-
-  // Crisp [Raw -> Goods] recipe tag below nameplate
-  ctx.save();
-  const tagY = labelY + 15;
-  const tagW = 46;
-  const tagH = 14;
-  ctx.fillStyle = 'rgba(255, 253, 249, 0.92)';
-  ctx.strokeStyle = 'rgba(93, 71, 58, 0.38)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(st.x - tagW / 2, tagY - tagH / 2, tagW, tagH, 7);
-  ctx.fill();
-  ctx.stroke();
-
-  drawTokenIcon(ctx, { kind: 'raw' }, st.x - 12, tagY, 0.72);
-  ctx.fillStyle = CONFIG.COLORS.ink;
-  ctx.font = 'bold 9px sans-serif';
+  ctx.fillStyle = pal.ink;
+  ctx.font = 'bold 10.5px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('→', st.x, tagY + 0.5);
-  drawTokenIcon(ctx, { kind: 'goods' }, st.x + 12, tagY, 0.72);
+  ctx.fillText(title, x, sub ? y - 4.5 : y + 0.5);
+
+  if (sub) {
+    ctx.fillStyle = pal.muted;
+    ctx.font = '600 8.5px sans-serif';
+    ctx.fillText(sub, x, y + 6.5);
+  }
   ctx.restore();
 }
 
-function drawStations(ctx, state) {
+function drawStations(ctx, state, pal) {
   const hoveredId = state.interaction.hoveredStationId;
+  const isNight = state.theme === 'night';
+  const showAllLabels = state.camera.zoom >= 1.45;
 
   for (const st of state.stations) {
     const isHovered = st.id === hoveredId;
@@ -774,16 +678,17 @@ function drawStations(ctx, state) {
     // Overflow radial warning ring
     if (st.overflowTimer > 0) {
       const frac = Math.min(1, st.overflowTimer / CONFIG.OVERFLOW_DURATION);
+      const warnR = r + (st.isInterchange ? 12 : 9);
       ctx.save();
       ctx.beginPath();
-      ctx.arc(st.x, st.y, r + 9, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(217, 78, 52, 0.2)';
+      ctx.arc(st.x, st.y, warnR, 0, Math.PI * 2);
+      ctx.strokeStyle = isNight ? 'rgba(248, 113, 113, 0.22)' : 'rgba(217, 78, 52, 0.22)';
       ctx.lineWidth = 4;
       ctx.stroke();
 
       ctx.beginPath();
-      ctx.arc(st.x, st.y, r + 9, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
-      ctx.strokeStyle = CONFIG.COLORS.danger;
+      ctx.arc(st.x, st.y, warnR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
+      ctx.strokeStyle = pal.danger;
       ctx.lineWidth = 4;
       ctx.lineCap = 'round';
       ctx.stroke();
@@ -794,74 +699,155 @@ function drawStations(ctx, state) {
     if (isHovered) {
       ctx.save();
       ctx.beginPath();
-      ctx.arc(st.x, st.y, r + 6, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(35, 38, 41, 0.25)';
+      ctx.arc(st.x, st.y, r + 7, 0, Math.PI * 2);
+      ctx.strokeStyle = isNight ? 'rgba(241, 245, 249, 0.28)' : 'rgba(35, 38, 41, 0.24)';
       ctx.lineWidth = 2;
       ctx.stroke();
       ctx.restore();
     }
 
-    if (st.kind === 'settlement') {
-      drawSettlementLandmark(ctx, st, r);
-    } else if (st.kind === 'resource') {
-      drawResourceLandmark(ctx, st, r);
-    } else if (st.kind === 'factory') {
-      drawFactoryLandmark(ctx, st, r);
-    } else {
-      drawShape(ctx, st.shape, st.x, st.y, r, CONFIG.COLORS.stationFill, CONFIG.COLORS.ink, 3);
+    // Interchange outer crisp ring
+    if (st.isInterchange) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(st.x, st.y, r + 4.2, 0, Math.PI * 2);
+      ctx.strokeStyle = pal.ink;
+      ctx.lineWidth = 2.4;
+      ctx.stroke();
+      ctx.restore();
     }
 
-    // Waiting tokens around station
+    // Bold Geometric Station Node
+    ctx.save();
+    ctx.fillStyle = pal.stationFill;
+    ctx.strokeStyle = pal.ink;
+    ctx.lineWidth = 3.2;
+    ctx.lineJoin = 'round';
+
+    if (st.kind === 'settlement') {
+      const tier = st.tier || (st.subtype === 'city' ? 3 : st.subtype === 'town' ? 2 : 1);
+      if (tier >= 3) {
+        // City: Bold Double-Ring Hub (r * 1.18) with thick inner crestColor ring (lineWidth = 4.2)
+        const hubR = r * 1.18;
+        ctx.beginPath();
+        ctx.arc(st.x, st.y, hubR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(st.x, st.y, Math.max(4, hubR - 5.5), 0, Math.PI * 2);
+        ctx.strokeStyle = st.crestColor || '#2563EB';
+        ctx.lineWidth = 4.2;
+        ctx.stroke();
+      } else if (tier === 2) {
+        // Town: Crisp Rounded Square (r * 1.02, rx = 5)
+        const s = r * 1.02;
+        ctx.beginPath();
+        ctx.roundRect(st.x - s, st.y - s, s * 2, s * 2, 5);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        // Hamlet: Crisp Circle (r)
+        ctx.beginPath();
+        ctx.arc(st.x, st.y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    } else if (st.kind === 'resource') {
+      // Resource Site: Bold Equilateral Rounded Triangle
+      drawRoundedTriangle(ctx, st.x, st.y + 1, r * 1.16);
+      ctx.fill();
+      ctx.stroke();
+
+      if (st.subtype === 'mine') {
+        // Slate inner diamond/pick emblem
+        ctx.fillStyle = '#64748B';
+        ctx.beginPath();
+        ctx.moveTo(st.x, st.y - 4.5);
+        ctx.lineTo(st.x + 5, st.y + 1.5);
+        ctx.lineTo(st.x, st.y + 6.5);
+        ctx.lineTo(st.x - 5, st.y + 1.5);
+        ctx.closePath();
+        ctx.fill();
+      } else {
+        // Forest deep green inner emblem
+        ctx.fillStyle = '#16A34A';
+        drawRoundedTriangle(ctx, st.x, st.y + 2, r * 0.46);
+        ctx.fill();
+      }
+    } else if (st.kind === 'factory') {
+      // Factory: Bold Sawtooth-Top Square silhouette (r * 1.08) in pal.ink + terracotta accent
+      const s = r * 1.08;
+      ctx.beginPath();
+      ctx.roundRect(st.x - s, st.y - s, s * 2, s * 2, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      // Sawtooth silhouette inside
+      ctx.fillStyle = pal.ink;
+      ctx.beginPath();
+      ctx.moveTo(st.x - s * 0.62, st.y + s * 0.46);
+      ctx.lineTo(st.x - s * 0.62, st.y - s * 0.36);
+      ctx.lineTo(st.x - s * 0.18, st.y - s * 0.04);
+      ctx.lineTo(st.x - s * 0.18, st.y - s * 0.36);
+      ctx.lineTo(st.x + s * 0.26, st.y - s * 0.04);
+      ctx.lineTo(st.x + s * 0.26, st.y - s * 0.36);
+      ctx.lineTo(st.x + s * 0.62, st.y - s * 0.04);
+      ctx.lineTo(st.x + s * 0.62, st.y + s * 0.46);
+      ctx.closePath();
+      ctx.fill();
+
+      // Warm industrial terracotta accent bar
+      ctx.fillStyle = '#EA580C';
+      ctx.fillRect(st.x - s * 0.62, st.y + s * 0.28, s * 1.24, s * 0.22);
+    } else {
+      drawShape(ctx, st.shape, st.x, st.y, r, pal.stationFill, pal.ink, 3.2);
+    }
+    ctx.restore();
+
+    // Rim progress arcs & factory input dots
+    drawRimProgress(ctx, st, r, pal, isNight);
+
+    // Dynamic track-free waiting queue
     if (st.queue && st.queue.length > 0) {
-      const cols = st.capacity >= 10 ? 5 : 4;
-      const startX = st.x + r + 11;
-      const startY = st.y - 8;
+      const qAngle =
+        typeof st.queueAngle === 'number' ? st.queueAngle : computeStationQueueAngle(state, st);
+      const ux = Math.cos(qAngle);
+      const uy = Math.sin(qAngle);
+      const px = -uy;
+      const py = ux;
+      const cols = 4;
+      const spacing = 17;
+      const startDist = r + 16;
+      const rowCount = Math.ceil(st.queue.length / cols);
+
       for (let i = 0; i < st.queue.length; i++) {
         const col = i % cols;
         const row = Math.floor(i / cols);
-        const tx = startX + col * 14;
-        const ty = startY + row * 13;
-        drawTokenIcon(ctx, st.queue[i], tx, ty, 1.0);
+        const distAlong = startDist + col * spacing;
+        const rowOffset = (row - (rowCount - 1) * 0.5) * spacing;
+        const tx = st.x + ux * distAlong + px * rowOffset;
+        const ty = st.y + uy * distAlong + py * rowOffset;
+
+        ctx.save();
+        ctx.fillStyle = pal.queueHalo;
+        ctx.beginPath();
+        ctx.arc(tx, ty, 9.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        drawTokenIcon(ctx, st.queue[i], tx, ty, 1.0, pal);
       }
+    }
+
+    // Minimalist hover / high-zoom label
+    if (isHovered || showAllLabels) {
+      drawHoverLabel(ctx, st, r, pal, isNight);
     }
   }
 }
 
-function drawExpressLoco(ctx, x, y, angle, lineColor, hovered) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(angle);
-  const w = 24;
-  const h = 13;
-
-  if (hovered) {
-    ctx.strokeStyle = 'rgba(43, 108, 176, 0.72)';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4);
-  }
-
-  ctx.fillStyle = '#232629';
-  ctx.strokeStyle = '#FFFDF9';
-  ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  ctx.moveTo(-w / 2, -h / 2);
-  ctx.lineTo(w / 2 - 6, -h / 2);
-  ctx.quadraticCurveTo(w / 2 + 2, -h / 2, w / 2 + 3, 0);
-  ctx.quadraticCurveTo(w / 2 + 2, h / 2, w / 2 - 6, h / 2);
-  ctx.lineTo(-w / 2, h / 2);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
-  // Line-color nose & side accent
-  ctx.fillStyle = lineColor;
-  ctx.fillRect(-w / 2 + 2, -h / 2 + 2, 7, h - 4);
-  ctx.fillStyle = '#E2E8F0';
-  ctx.fillRect(w / 2 - 7, -3.5, 4, 7);
-  ctx.restore();
-}
-
-function drawExpressCoach(ctx, x, y, angle, lineColor, cargoSlice, hovered) {
+function drawExpressUnit(ctx, x, y, angle, lineColor, isLead, cargoSlice, hovered, pal) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(angle);
@@ -869,65 +855,42 @@ function drawExpressCoach(ctx, x, y, angle, lineColor, cargoSlice, hovered) {
   const h = 12;
 
   if (hovered) {
-    ctx.strokeStyle = 'rgba(43, 108, 176, 0.72)';
-    ctx.lineWidth = 3.5;
-    ctx.strokeRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4);
-  }
-
-  ctx.fillStyle = lineColor;
-  ctx.strokeStyle = '#FFFDF9';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.roundRect(-w / 2, -h / 2, w, h, 3);
-  ctx.fill();
-  ctx.stroke();
-
-  // 3 illuminated window bays (fill as passengers board)
-  const bayXs = [-6, 0, 6];
-  for (let i = 0; i < 3; i++) {
-    const occupied = i < cargoSlice.length;
-    ctx.fillStyle = occupied ? '#FEF08A' : 'rgba(255, 253, 249, 0.22)';
-    ctx.strokeStyle = occupied ? '#FFFDF9' : 'rgba(255, 253, 249, 0.35)';
-    ctx.lineWidth = 0.8;
+    ctx.strokeStyle = pal.ink;
+    ctx.lineWidth = 3.6;
     ctx.beginPath();
-    ctx.roundRect(bayXs[i] - 2.2, -3.2, 4.4, 6.4, 1);
-    ctx.fill();
+    ctx.roundRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4, 6);
     ctx.stroke();
   }
-  ctx.restore();
-}
 
-function drawFreightLoco(ctx, x, y, angle, lineColor, hovered) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(angle);
-  const w = 24;
-  const h = 14;
-
-  if (hovered) {
-    ctx.strokeStyle = 'rgba(43, 108, 176, 0.72)';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4);
-  }
-
-  // Heavy cab-forward / hood diesel body
-  ctx.fillStyle = '#5D473A';
-  ctx.strokeStyle = '#FFFDF9';
-  ctx.lineWidth = 1.6;
+  ctx.fillStyle = lineColor;
+  ctx.strokeStyle = pal.stationFill;
+  ctx.lineWidth = 1.4;
   ctx.beginPath();
-  ctx.roundRect(-w / 2, -h / 2, w, h, 2.5);
+  ctx.roundRect(-w / 2, -h / 2, w, h, 5);
   ctx.fill();
   ctx.stroke();
 
-  // Line-color side stripe & cab roof
-  ctx.fillStyle = lineColor;
-  ctx.fillRect(-w / 2 + 2, -h / 2 + 1.5, w - 9, h - 3);
-  ctx.fillStyle = '#3B3832';
-  ctx.fillRect(w / 2 - 8, -h / 2 + 2, 6, h - 4);
+  if (isLead) {
+    // Subtle nose notch on lead unit
+    ctx.fillStyle = pal.stationFill;
+    ctx.beginPath();
+    ctx.roundRect(w / 2 - 6.5, -3.5, 3.8, 7, 1.8);
+    ctx.fill();
+  } else {
+    // Up to 3 clean high-contrast circular passenger pips inside trailing car
+    const pipXs = [-6, 0, 6];
+    for (let i = 0; i < 3; i++) {
+      const occupied = i < cargoSlice.length;
+      ctx.beginPath();
+      ctx.arc(pipXs[i], 0, 2.3, 0, Math.PI * 2);
+      ctx.fillStyle = occupied ? '#FFFFFF' : 'rgba(255, 255, 255, 0.25)';
+      ctx.fill();
+    }
+  }
   ctx.restore();
 }
 
-function drawFreightWagon(ctx, x, y, angle, lineColor, cargoSlice, hovered) {
+function drawFreightUnit(ctx, x, y, angle, lineColor, isLead, cargoSlice, hovered, pal) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(angle);
@@ -935,72 +898,76 @@ function drawFreightWagon(ctx, x, y, angle, lineColor, cargoSlice, hovered) {
   const h = 13;
 
   if (hovered) {
-    ctx.strokeStyle = 'rgba(43, 108, 176, 0.72)';
-    ctx.lineWidth = 3.5;
-    ctx.strokeRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4);
+    ctx.strokeStyle = pal.ink;
+    ctx.lineWidth = 3.6;
+    ctx.beginPath();
+    ctx.roundRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4, 5);
+    ctx.stroke();
   }
 
-  // Open-top flatbed/hopper wagon
-  ctx.fillStyle = '#4A3B32';
-  ctx.strokeStyle = '#FFFDF9';
+  // Flat-bed rounded car in lineColor
+  ctx.fillStyle = lineColor;
+  ctx.strokeStyle = pal.stationFill;
   ctx.lineWidth = 1.4;
   ctx.beginPath();
-  ctx.roundRect(-w / 2, -h / 2, w, h, 2);
+  ctx.roundRect(-w / 2, -h / 2, w, h, 3.5);
   ctx.fill();
   ctx.stroke();
 
-  // Line-colored side rails
-  ctx.fillStyle = lineColor;
-  ctx.fillRect(-w / 2 + 1, -h / 2 + 1, w - 2, 2);
-  ctx.fillRect(-w / 2 + 1, h / 2 - 3, w - 2, 2);
+  if (isLead) {
+    // Clean geometric cab visor on lead unit
+    ctx.fillStyle = pal.ink;
+    ctx.beginPath();
+    ctx.roundRect(w / 2 - 8, -4.5, 5.5, 9, 2);
+    ctx.fill();
+  } else {
+    // Dark recessed cargo well showing miniature chubby raw/goods icons
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.45)';
+    ctx.beginPath();
+    ctx.roundRect(-w / 2 + 2.2, -h / 2 + 2.2, w - 4.4, h - 4.4, 2);
+    ctx.fill();
 
-  // 3 visible cargo slots inside wagon
-  const slotXs = [-6, 0, 6];
-  for (let i = 0; i < 3; i++) {
-    const tok = cargoSlice[i];
-    if (!tok) {
-      ctx.fillStyle = 'rgba(255, 253, 249, 0.14)';
-      ctx.fillRect(slotXs[i] - 2, -2.5, 4, 5);
-    } else if (tok.kind === 'raw') {
-      ctx.fillStyle = '#C05621';
-      ctx.strokeStyle = '#F6AD55';
-      ctx.lineWidth = 0.8;
-      ctx.beginPath();
-      ctx.roundRect(slotXs[i] - 2.4, -3.2, 4.8, 6.4, 1.2);
-      ctx.fill();
-      ctx.stroke();
-    } else {
-      // Stenciled goods crate
-      ctx.fillStyle = '#2B6CB0';
-      ctx.strokeStyle = '#EBF8FF';
-      ctx.lineWidth = 0.8;
-      ctx.fillRect(slotXs[i] - 2.5, -3, 5, 6);
-      ctx.strokeRect(slotXs[i] - 2.5, -3, 5, 6);
+    const slotXs = [-5.8, 0, 5.8];
+    for (let i = 0; i < 3; i++) {
+      const tok = cargoSlice[i];
+      if (tok) {
+        drawTokenIcon(ctx, tok, slotXs[i], 0, 0.38, pal);
+      }
     }
   }
   ctx.restore();
 }
 
-function drawTrains(ctx, state) {
+function drawTrains(ctx, state, pal) {
   const carCap = CONFIG.CAR_CAPACITY || 3;
-  const carSpacing = CONFIG.CAR_SPACING || 26;
+  const carSpacing = CONFIG.CAR_SPACING || 23;
+  const spotlightId = state.interaction.spotlightLineId;
+  const hasSpotlight = spotlightId !== null && spotlightId !== undefined;
 
   for (const tr of state.trains) {
     const line = state.lines[tr.lineId];
     if (!line) continue;
+
+    const lineColor = getLineColor(state, tr.lineId);
     const isFreight = tr.type === 'freight';
     const isHovered = state.interaction.hoveredTrainId === tr.id;
+    const isDimmed = hasSpotlight && spotlightId !== tr.lineId;
     const cars = tr.cars || CONFIG.TRAIN_DEFAULT_CARS || 2;
 
-    const poses = [{ x: tr.x, y: tr.y, angle: tr.angle }];
-    for (let c = 1; c <= cars; c++) {
-      poses.push(sampleTrainCarriagePose(tr, c * carSpacing));
+    let poses = Array.isArray(tr.unitPoses) && tr.unitPoses.length > 0 ? tr.unitPoses : null;
+    if (!poses) {
+      poses = [{ x: tr.x, y: tr.y, angle: tr.angle }];
+      for (let c = 1; c <= cars; c++) {
+        poses.push(sampleTrainCarriagePose(tr, c * carSpacing));
+      }
     }
 
-    // Coupler bars between locomotive and each carriage
     ctx.save();
-    ctx.strokeStyle = '#232629';
-    ctx.lineWidth = 2.6;
+    if (isDimmed) ctx.globalAlpha = 0.18;
+
+    // Coupler bars between articulated units
+    ctx.strokeStyle = pal.ink;
+    ctx.lineWidth = 2.4;
     ctx.lineCap = 'round';
     for (let c = 1; c < poses.length; c++) {
       ctx.beginPath();
@@ -1008,45 +975,57 @@ function drawTrains(ctx, state) {
       ctx.lineTo(poses[c].x, poses[c].y);
       ctx.stroke();
     }
-    ctx.restore();
 
-    // Draw trailing carriages back-to-front
-    for (let c = cars; c >= 1; c--) {
+    // Draw trailing cars back-to-front, then lead unit (poses[0])
+    for (let c = poses.length - 1; c >= 0; c--) {
       const pose = poses[c];
+      const isLead = c === 0;
       const startIdx = (c - 1) * carCap;
-      const carCargo = tr.cargo.slice(startIdx, startIdx + carCap);
-      if (isFreight) {
-        drawFreightWagon(ctx, pose.x, pose.y, pose.angle, line.color, carCargo, isHovered);
-      } else {
-        drawExpressCoach(ctx, pose.x, pose.y, pose.angle, line.color, carCargo, isHovered);
-      }
-    }
+      const carCargo = isLead ? [] : tr.cargo.slice(startIdx, startIdx + carCap);
 
-    // Draw locomotive
-    if (isFreight) {
-      drawFreightLoco(ctx, tr.x, tr.y, tr.angle, line.color, isHovered);
-    } else {
-      drawExpressLoco(ctx, tr.x, tr.y, tr.angle, line.color, isHovered);
+      if (isFreight) {
+        drawFreightUnit(ctx, pose.x, pose.y, pose.angle, lineColor, isLead, carCargo, isHovered, pal);
+      } else {
+        drawExpressUnit(ctx, pose.x, pose.y, pose.angle, lineColor, isLead, carCargo, isHovered, pal);
+      }
     }
 
     // Waiting-at-siding amber signal dot
     if (tr.state === 'waitingBlock') {
-      ctx.save();
-      ctx.fillStyle = '#D69E2E';
-      ctx.strokeStyle = '#FFFDF9';
+      const lead = poses[0];
+      ctx.fillStyle = '#EAB308';
+      ctx.strokeStyle = pal.stationFill;
       ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.arc(tr.x, tr.y - 14, 4, 0, Math.PI * 2);
+      ctx.arc(lead.x, lead.y - 14, 4, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
-      ctx.restore();
     }
+
+    ctx.restore();
   }
 }
 
-function drawFX(ctx, state) {
+function drawFX(ctx, state, pal) {
   const fx = state.fx;
   if (!fx) return;
+
+  // Overcrowding warning pulse rings
+  if (fx.pulses && fx.pulses.length > 0) {
+    ctx.save();
+    for (const pl of fx.pulses) {
+      const t = Math.min(1, pl.age / (pl.life || 0.9));
+      const alpha = Math.max(0, (1 - t) * 0.78);
+      if (alpha <= 0.01) continue;
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = pl.color || pal.danger;
+      ctx.lineWidth = 3.2 * (1 - t * 0.45);
+      ctx.beginPath();
+      ctx.arc(pl.x, pl.y, pl.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
 
   // Smoke & exhaust puffs
   if (fx.puffs && fx.puffs.length > 0) {
@@ -1067,7 +1046,7 @@ function drawFX(ctx, state) {
   // Parabolic boarding/delivery token hops
   if (fx.hops && fx.hops.length > 0) {
     for (const h of fx.hops) {
-      drawTokenIcon(ctx, { kind: h.tokenKind, crestColor: h.color }, h.x, h.y, 1.05);
+      drawTokenIcon(ctx, { kind: h.tokenKind, crestColor: h.color }, h.x, h.y, 1.0, pal);
     }
   }
 
@@ -1082,16 +1061,16 @@ function drawFX(ctx, state) {
       const alpha = t > 0.65 ? Math.max(0, 1 - (t - 0.65) / 0.35) : 1;
       ctx.globalAlpha = alpha;
       ctx.lineWidth = 3.5;
-      ctx.strokeStyle = 'rgba(255, 253, 249, 0.92)';
+      ctx.strokeStyle = pal.stationFill;
       ctx.strokeText(f.text, f.x, f.y);
-      ctx.fillStyle = f.color || CONFIG.COLORS.ink;
+      ctx.fillStyle = f.color || pal.ink;
       ctx.fillText(f.text, f.x, f.y);
     }
     ctx.restore();
   }
 }
 
-function drawDragPreview(ctx, state) {
+function drawDragPreview(ctx, state, pal) {
   const drag = state.interaction.drag;
   if (!drag) return;
 
@@ -1100,19 +1079,22 @@ function drawDragPreview(ctx, state) {
     const fromSt = state.stationById.get(drag.fromStationId);
     if (!line || !fromSt) return;
 
+    const lineColor = getLineColor(state, line.id);
     const targetSt = drag.snapStationId ? state.stationById.get(drag.snapStationId) : null;
     const tx = targetSt ? targetSt.x : drag.worldX;
     const ty = targetSt ? targetSt.y : drag.worldY;
 
-    const pts = buildOctilinearPoints(fromSt.x, fromSt.y, tx, ty, state.river, state.hills);
+    const pts = buildOctilinearPoints(fromSt.x, fromSt.y, tx, ty, state.river, state.hills, {
+      stations: state.stations,
+    });
     const crossings = countRiverCrossings(pts, state.river);
     const existing = targetSt ? state.corridors.get(edgeKey(fromSt.id, targetSt.id)) : null;
     const needsBridge = crossings > 0 && !(existing && existing.hasBridge);
     const blocked = needsBridge && state.inventory.bridge <= 0;
 
     ctx.save();
-    ctx.strokeStyle = blocked ? CONFIG.COLORS.danger : line.color;
-    ctx.lineWidth = 4.5;
+    ctx.strokeStyle = blocked ? pal.danger : lineColor;
+    ctx.lineWidth = 4.6;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.globalAlpha = 0.72;
@@ -1123,11 +1105,11 @@ function drawDragPreview(ctx, state) {
       const mid = pts[Math.floor(pts.length / 2)];
       ctx.setLineDash([]);
       ctx.globalAlpha = 0.95;
-      ctx.fillStyle = blocked ? CONFIG.COLORS.danger : CONFIG.COLORS.ink;
+      ctx.fillStyle = blocked ? pal.danger : pal.ink;
       ctx.beginPath();
       ctx.roundRect(mid.x - 36, mid.y - 11, 72, 22, 11);
       ctx.fill();
-      ctx.fillStyle = '#FFFDF9';
+      ctx.fillStyle = pal.stationFill;
       ctx.font = 'bold 10px sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -1136,15 +1118,16 @@ function drawDragPreview(ctx, state) {
     ctx.restore();
   } else if (
     state.interaction.mode === 'dragToken' ||
-    state.interaction.mode === 'dragTrain'
+    state.interaction.mode === 'dragTrain' ||
+    state.interaction.mode === 'dragUpgrade'
   ) {
     ctx.save();
-    ctx.globalAlpha = 0.85;
-    ctx.fillStyle = CONFIG.COLORS.ink;
+    ctx.globalAlpha = 0.88;
+    ctx.fillStyle = pal.ink;
     ctx.beginPath();
     ctx.arc(drag.worldX, drag.worldY, 13, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = '#FFFDF9';
+    ctx.fillStyle = pal.stationFill;
     ctx.font = 'bold 9px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -1154,6 +1137,7 @@ function drawDragPreview(ctx, state) {
       car: '+CAR',
       doubleTrack: '2×',
       tunnel: 'TUN',
+      interchange: 'INT',
     };
     ctx.fillText(labelMap[drag.tool] || 'TRN', drag.worldX, drag.worldY + 0.5);
     ctx.restore();
@@ -1161,11 +1145,12 @@ function drawDragPreview(ctx, state) {
 }
 
 export function renderGame(ctx, state) {
+  const pal = getThemePalette(state);
   const { width, height, dpr } = state.viewport;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  // Paper background
-  ctx.fillStyle = CONFIG.COLORS.paper;
+  // Flat Mini Metro paper / night background
+  ctx.fillStyle = pal.bg;
   ctx.fillRect(0, 0, width, height);
 
   const scale = getEffectiveScale(state);
@@ -1174,23 +1159,22 @@ export function renderGame(ctx, state) {
   ctx.scale(scale, scale);
   ctx.translate(-state.camera.x, -state.camera.y);
 
-  drawGrid(ctx);
-  drawHills(ctx, state.hills);
-  drawRiver(ctx, state);
-  drawOnboardingGuide(ctx, state);
-  drawCorridors(ctx, state);
-  drawTBars(ctx, state);
-  drawStations(ctx, state);
-  drawTrains(ctx, state);
-  drawFX(ctx, state);
-  drawDragPreview(ctx, state);
+  drawHills(ctx, state.hills, pal);
+  drawRiver(ctx, state, pal);
+  drawOnboardingGuide(ctx, state, pal);
+  drawCorridors(ctx, state, pal);
+  drawTBars(ctx, state, pal);
+  drawStations(ctx, state, pal);
+  drawTrains(ctx, state, pal);
+  drawFX(ctx, state, pal);
+  drawDragPreview(ctx, state, pal);
 
   // Flash message in world space
   if (state.interaction.flashMessage) {
     const fm = state.interaction.flashMessage;
     ctx.save();
     ctx.globalAlpha = Math.min(1, fm.timer * 1.5);
-    ctx.fillStyle = CONFIG.COLORS.danger;
+    ctx.fillStyle = pal.danger;
     ctx.font = 'bold 13px sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(fm.text, fm.x, fm.y - 28);

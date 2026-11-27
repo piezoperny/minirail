@@ -1,44 +1,58 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="day">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#232629">
   <title>Mini Rail</title>
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+  <link rel="manifest" href="site.webmanifest">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="app">
     <canvas id="game-canvas"></canvas>
 
-    <!-- Top HUD -->
-    <header id="top-hud" class="hud-panel">
-      <div class="hud-brand">
-        <span class="brand-mark"></span>
-        <span class="brand-title">MINI RAIL</span>
-      </div>
+    <!-- Top-Left Subtle Brand Badge -->
+    <div id="brand-badge" class="hud-panel hud-brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 64 64" width="22" height="22">
+          <rect x="2" y="2" width="60" height="60" rx="14" fill="#232629" />
+          <path d="M 14 50 L 32 32 L 52 32" fill="none" stroke="#EAB308" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M 32 12 L 32 32 L 50 14" fill="none" stroke="#3B82F6" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M 14 14 L 50 50" fill="none" stroke="#FF5A3D" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="32" cy="32" r="9.5" fill="#FFFDF9" stroke="#232629" stroke-width="3.5" />
+          <circle cx="32" cy="32" r="3.5" fill="#FF5A3D" />
+        </svg>
+      </span>
+      <span class="brand-title">MINI RAIL</span>
+    </div>
 
+    <!-- Top-Right Mini Metro HUD Pill -->
+    <header id="top-hud" class="hud-panel">
       <div class="hud-stats">
-        <div class="stat-chip" title="Total passenger &amp; freight deliveries completed">
-          <span class="stat-label">DELIVERED</span>
-          <span id="hud-score" class="stat-value">0</span>
-        </div>
-        <div class="stat-chip" title="Manufactured Goods supplied to grow Hamlets into Towns &amp; Cities">
-          <span class="stat-label">GOODS</span>
-          <span id="hud-goods" class="stat-value">0</span>
-        </div>
-        <div class="stat-chip" title="Tier 3 Cities active on the network">
-          <span class="stat-label">CITIES</span>
-          <span id="hud-cities" class="stat-value">1</span>
-        </div>
-        <div class="stat-chip" title="Current week &amp; day">
-          <span class="stat-label">WEEK <span id="hud-week">1</span></span>
-          <span id="hud-day" class="stat-value">DAY 1</span>
-        </div>
-        <div class="day-progress-ring" title="Day progress">
-          <svg viewBox="0 0 36 36" width="28" height="28">
-            <circle class="ring-bg" cx="18" cy="18" r="14"></circle>
-            <circle id="day-ring-fg" class="ring-fg" cx="18" cy="18" r="14" stroke-dasharray="87.96" stroke-dashoffset="87.96"></circle>
+        <div class="analog-clock" title="Day cycle">
+          <svg viewBox="0 0 36 36" width="28" height="28" aria-hidden="true">
+            <circle class="clock-face" cx="18" cy="18" r="14"></circle>
+            <line class="clock-tick" x1="18" y1="6" x2="18" y2="8.5"></line>
+            <g id="clock-hand-group" transform="rotate(0 18 18)">
+              <line class="clock-hand" x1="18" y1="18" x2="18" y2="7.5"></line>
+            </g>
+            <circle class="clock-pivot" cx="18" cy="18" r="2.2"></circle>
           </svg>
+        </div>
+
+        <span id="hud-weekday" class="weekday-badge" title="Current week and day">W1 · MON</span>
+
+        <div class="score-pill" tabindex="0" aria-label="Total deliveries">
+          <span class="score-dot" aria-hidden="true"></span>
+          <span id="hud-score" class="score-value">0</span>
+          <div class="score-tooltip" role="tooltip">
+            <div class="tooltip-row"><span>Goods</span><strong id="hud-goods">0</strong></div>
+            <div class="tooltip-row"><span>Cities</span><strong id="hud-cities">1</strong></div>
+          </div>
         </div>
       </div>
 
@@ -48,10 +62,15 @@
           <button id="btn-speed-1" class="speed-btn active" data-speed="1" title="Normal Speed (1)">1×</button>
           <button id="btn-speed-2" class="speed-btn" data-speed="2" title="Fast Speed (2)">2×</button>
         </div>
+        <button id="btn-fit" class="icon-btn" title="Fit Map (F / 0)" aria-label="Fit Map">⊡</button>
+        <button id="btn-theme" class="icon-btn" title="Toggle Day/Night Mode (N)" aria-label="Toggle Theme">☾</button>
         <button id="btn-mute" class="icon-btn" title="Toggle Sound (M)" aria-label="Toggle Sound">🔊</button>
         <button id="btn-help" class="icon-btn" title="Field Manual" aria-label="Field Manual">?</button>
       </div>
     </header>
+
+    <!-- Off-Screen Station Spawn / Overflow Edge Alerts -->
+    <div id="edge-alerts" class="edge-alerts" aria-live="polite"></div>
 
     <!-- Subtle Contextual Hint Toast -->
     <div id="hint-banner" class="hint-banner hidden"></div>
@@ -64,12 +83,12 @@
         <div class="dock-token" data-tool="express" draggable="false" title="Express Train (Locomotive + 2 coaches, fast passenger service)">
           <span class="token-icon token-express">
             <svg viewBox="0 0 44 20" width="38" height="18" aria-hidden="true">
-              <rect x="2" y="6" width="14" height="9" rx="1.5" fill="#232629"/>
-              <rect x="4.5" y="8.5" width="3.5" height="3" rx="0.5" fill="#FFFDF9"/>
-              <rect x="10" y="8.5" width="3.5" height="3" rx="0.5" fill="#FFFDF9"/>
-              <line x1="16" y1="11.5" x2="20" y2="11.5" stroke="#232629" stroke-width="2"/>
-              <path d="M20,15 L20,6 Q20,4 22,4 L34,4 L41,11 L41,15 Z" fill="#232629"/>
-              <path d="M24,7 L33,7 L36,10 L24,10 Z" fill="#FFFDF9" opacity="0.85"/>
+              <rect x="2" y="6" width="14" height="9" rx="1.5" fill="currentColor"/>
+              <rect x="4.5" y="8.5" width="3.5" height="3" rx="0.5" fill="var(--paper-bg)"/>
+              <rect x="10" y="8.5" width="3.5" height="3" rx="0.5" fill="var(--paper-bg)"/>
+              <line x1="16" y1="11.5" x2="20" y2="11.5" stroke="currentColor" stroke-width="2"/>
+              <path d="M20,15 L20,6 Q20,4 22,4 L34,4 L41,11 L41,15 Z" fill="currentColor"/>
+              <path d="M24,7 L33,7 L36,10 L24,10 Z" fill="var(--paper-bg)" opacity="0.85"/>
             </svg>
           </span>
           <span class="token-label">EXPRESS</span>
@@ -78,12 +97,12 @@
         <div class="dock-token" data-tool="freight" draggable="false" title="Freight Train (Locomotive + 2 wagons, heavy cargo with minimal hill penalty)">
           <span class="token-icon token-freight">
             <svg viewBox="0 0 44 20" width="38" height="18" aria-hidden="true">
-              <path d="M2,8 L2,15 L16,15 L16,8 L14,8 L14,12 L4,12 L4,8 Z" fill="#5D473A"/>
+              <path d="M2,8 L2,15 L16,15 L16,8 L14,8 L14,12 L4,12 L4,8 Z" fill="currentColor"/>
               <rect x="5" y="6.5" width="4.5" height="5" rx="0.6" fill="#C05621"/>
               <rect x="10" y="7.5" width="3.5" height="4" rx="0.6" fill="#D69E2E"/>
-              <line x1="16" y1="12" x2="20" y2="12" stroke="#5D473A" stroke-width="2"/>
-              <path d="M20,15 L20,7 L27,7 L27,4 L35,4 L35,8 L41,8 L41,15 Z" fill="#5D473A"/>
-              <rect x="29" y="6" width="4" height="3.5" rx="0.5" fill="#EDE5D5"/>
+              <line x1="16" y1="12" x2="20" y2="12" stroke="currentColor" stroke-width="2"/>
+              <path d="M20,15 L20,7 L27,7 L27,4 L35,4 L35,8 L41,8 L41,15 Z" fill="currentColor"/>
+              <rect x="29" y="6" width="4" height="3.5" rx="0.5" fill="var(--paper-bg)"/>
             </svg>
           </span>
           <span class="token-label">FREIGHT</span>
@@ -91,7 +110,10 @@
         </div>
         <div class="dock-token" data-tool="car" draggable="false" title="+3 capacity carriage, up to 4 per train">
           <span class="token-icon token-car">
-            <svg viewBox="0 0 32 20" width="28" height="18" aria-hidden="true"><rect x="4" y="5" width="24" height="10" rx="2" fill="none" stroke="#232629" stroke-width="2.2"/><line x1="16" y1="5" x2="16" y2="15" stroke="#232629" stroke-width="1.5"/></svg>
+            <svg viewBox="0 0 32 20" width="28" height="18" aria-hidden="true">
+              <rect x="4" y="5" width="24" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2.2"/>
+              <line x1="16" y1="5" x2="16" y2="15" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
           </span>
           <span class="token-label">+CARRIAGE</span>
           <span class="token-badge" id="count-car">1</span>
@@ -101,42 +123,53 @@
       <div class="dock-section" id="dock-infra" aria-label="Infrastructure Upgrades">
         <div class="dock-token static-token" data-tool="bridge" title="Bridges (Auto-used when crossing rivers)">
           <span class="token-icon">
-            <svg viewBox="0 0 28 20" width="24" height="18"><path d="M2,15 Q14,4 26,15" fill="none" stroke="#2B6CB0" stroke-width="2.4"/><line x1="2" y1="15" x2="26" y2="15" stroke="#232629" stroke-width="2"/></svg>
+            <svg viewBox="0 0 28 20" width="24" height="18">
+              <path d="M2,15 Q14,4 26,15" fill="none" stroke="#2B6CB0" stroke-width="2.4"/>
+              <line x1="2" y1="15" x2="26" y2="15" stroke="currentColor" stroke-width="2"/>
+            </svg>
           </span>
           <span class="token-label">BRIDGE</span>
           <span class="token-badge" id="count-bridge">2</span>
         </div>
         <div class="dock-token" data-tool="doubleTrack" title="Double-Track Kit (Drag onto a track segment for 2-way passing &amp; overtaking)">
           <span class="token-icon">
-            <svg viewBox="0 0 28 20" width="24" height="18"><line x1="3" y1="7" x2="25" y2="7" stroke="#232629" stroke-width="2.2"/><line x1="3" y1="13" x2="25" y2="13" stroke="#232629" stroke-width="2.2"/></svg>
+            <svg viewBox="0 0 28 20" width="24" height="18">
+              <line x1="3" y1="7" x2="25" y2="7" stroke="currentColor" stroke-width="2.2"/>
+              <line x1="3" y1="13" x2="25" y2="13" stroke="currentColor" stroke-width="2.2"/>
+            </svg>
           </span>
           <span class="token-label">DOUBLE</span>
           <span class="token-badge" id="count-doubleTrack">1</span>
         </div>
         <div class="dock-token" data-tool="tunnel" title="Tunnel (Drag onto a hill segment to eliminate slowdown)">
           <span class="token-icon">
-            <svg viewBox="0 0 28 20" width="24" height="18"><path d="M5,16 L5,10 A9,9 0 0,1 23,10 L23,16" fill="none" stroke="#232629" stroke-width="2.4"/><line x1="2" y1="16" x2="26" y2="16" stroke="#8C7E6A" stroke-width="1.5"/></svg>
+            <svg viewBox="0 0 28 20" width="24" height="18">
+              <path d="M5,16 L5,10 A9,9 0 0,1 23,10 L23,16" fill="none" stroke="currentColor" stroke-width="2.4"/>
+              <line x1="2" y1="16" x2="26" y2="16" stroke="var(--ink-muted)" stroke-width="1.5"/>
+            </svg>
           </span>
           <span class="token-label">TUNNEL</span>
           <span class="token-badge" id="count-tunnel">1</span>
         </div>
+        <div class="dock-token is-hidden" id="interchange" data-tool="interchange" draggable="false" title="Interchange Hub (Drag onto a station for +6 capacity &amp; 2.5× faster boarding)">
+          <span class="token-icon">
+            <svg viewBox="0 0 28 20" width="24" height="18">
+              <circle cx="14" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="2"/>
+              <circle cx="14" cy="10" r="3.8" fill="none" stroke="currentColor" stroke-width="2"/>
+            </svg>
+          </span>
+          <span class="token-label">INTERCHANGE</span>
+          <span class="token-badge" id="count-interchange">0</span>
+        </div>
       </div>
     </footer>
 
-    <!-- Weekly Draft Modal -->
-    <div id="draft-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="draft-title">
-      <div class="modal-card">
-        <div class="modal-eyebrow">END OF WEEK <span id="draft-week-num">1</span></div>
-        <h2 id="draft-title">Regional Rail Expansion</h2>
-        <p class="modal-subtitle">Select <strong>1 Locomotive</strong> and <strong>1 Infrastructure Pack</strong> to continue.</p>
-
-        <div class="draft-section-label">1. Choose a Locomotive</div>
-        <div id="draft-loco-choices" class="draft-grid"></div>
-
-        <div class="draft-section-label">2. Choose an Infrastructure Pack</div>
-        <div id="draft-pack-choices" class="draft-grid"></div>
-
-        <button id="btn-draft-confirm" class="primary-btn" disabled>Confirm &amp; Resume</button>
+    <!-- 2-Tap Mini Metro Weekly Reward Overlay -->
+    <div id="draft-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="draft-prompt">
+      <div class="draft-overlay-card">
+        <div class="draft-week-eyebrow">WEEK <span id="draft-week-num">2</span></div>
+        <h2 id="draft-prompt" class="draft-prompt">Choose a locomotive</h2>
+        <div id="draft-choices" class="draft-circle-row"></div>
       </div>
     </div>
 
@@ -177,11 +210,11 @@
         <div class="modal-eyebrow">FIELD MANUAL</div>
         <h2 id="help-title">Mini Rail Controls &amp; Supply Chain</h2>
         <ul class="help-list">
-          <li><strong>Build Tracks:</strong> Click &amp; drag from any station (or line T-bar end) to another station. New lines auto-dispatch an idle matching locomotive!</li>
-          <li><strong>Supply Chain &amp; Growth:</strong> Haul Raw Materials from <strong>Resource Sites</strong> (Forests/Mines) to <strong>Factories</strong> to craft <strong>Goods</strong>, then deliver Goods to <strong>Hamlets &amp; Towns</strong> to grow them into <strong>Cities</strong> (+1 bonus upgrade!).</li>
+          <li><strong>Build Tracks:</strong> Drag from any station or line T-bar end to another station. Right-click a station to bypass/remove it; right-click a line pill to clear the route.</li>
+          <li><strong>Camera Controls:</strong> Scroll or pinch to zoom (`0.45×–2.5×`). Drag empty paper, middle-drag, or hold Space+drag to pan. Press <strong>F</strong> or <strong>0</strong> to fit map, <strong>N</strong> for Night Mode.</li>
+          <li><strong>Supply Chain &amp; Growth:</strong> Haul Raw Materials from <strong>Resource Sites</strong> (Forests/Mines) to <strong>Factories</strong> to craft <strong>Goods</strong>, then deliver Goods to <strong>Hamlets &amp; Towns</strong> to grow them into <strong>Cities</strong>.</li>
           <li><strong>Passenger Service:</strong> <strong>Express</strong> trains carry Commuters (Towns &rarr; Cities), Local Travelers (Cities &rarr; Towns), and color-coded <strong>Intercity Tickets</strong> between Cities.</li>
-          <li><strong>Consists &amp; +Carriage:</strong> Every locomotive spawns with <strong>2 coupled carriages</strong> (6 capacity). Drag <strong>+Carriage</strong> onto any car of a train for +3 capacity (up to 4 carriages).</li>
-          <li><strong>Terrain &amp; Upgrades:</strong> Drag <strong>Double-Track</strong> or <strong>Tunnel</strong> tokens onto segments; river crossings auto-use <strong>Bridges</strong>. Right-click a train or segment to reclaim/remove.</li>
+          <li><strong>Consists &amp; Upgrades:</strong> Drag <strong>+Carriage</strong> onto any car of a train, <strong>Double-Track</strong> or <strong>Tunnel</strong> onto segments, or <strong>Interchange</strong> onto a busy station.</li>
         </ul>
         <button id="btn-help-close" class="primary-btn">Back to Map</button>
       </div>

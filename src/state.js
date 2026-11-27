@@ -6,25 +6,30 @@ export const CONFIG = {
   BASE_VIEW_WIDTH: 1280,
   BASE_VIEW_HEIGHT: 780,
 
+  MIN_ZOOM: 0.45,
+  MAX_ZOOM: 2.50,
+
   LINE_COLORS: [
     '#D94E34', // Vermilion
-    '#2B6CB0', // Cobalt
-    '#D69E2E', // Amber
-    '#2F855A', // Forest
-    '#805AD5', // Plum
-    '#0987A0', // Teal
+    '#2563EB', // Cobalt
+    '#EAB308', // Amber
+    '#16A34A', // Forest
+    '#9333EA', // Plum
+    '#0891B2', // Teal
   ],
   LINE_NAMES: ['Red', 'Blue', 'Amber', 'Green', 'Plum', 'Teal'],
   MAX_LINES: 6,
 
   LINE_SPACING: 8,
-  FILLET_RADIUS: 28,
+  FILLET_RADIUS: 32,
+  STATION_PASS_FILLET: 18,
   STATION_RADIUS: 16,
-  T_BAR_OFFSET: 28,
+  T_BAR_OFFSET: 26,
   MIN_STATION_SPACING: 150,
 
   DAY_SECONDS: 10.5,
   DAYS_PER_WEEK: 7,
+  DAY_NAMES: ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'],
   OVERFLOW_DURATION: 30.0,
   OVERFLOW_DRAIN_RATE: 0.75,
 
@@ -39,10 +44,14 @@ export const CONFIG = {
   TRAIN_DEFAULT_CARS: 2,
   MAX_CARS_PER_TRAIN: 4,
   CAR_CAPACITY: 3,
-  CAR_SPACING: 26,
+  CAR_SPACING: 23,
+  BOGIE_WHEELBASE: 13,
   // Legacy capacity constants preserved for intermediate module compatibility
   TRAIN_BASE_CAPACITY: 0,
   CAR_CAPACITY_BONUS: 3,
+
+  INTERCHANGE_CAPACITY_BONUS: 6,
+  INTERCHANGE_DWELL_MULT: 0.4,
 
   FACTORY_PROCESS_TIME: 3.5,
   FACTORY_INPUT_MAX: 6,
@@ -82,20 +91,63 @@ export const CONFIG = {
   OVERTAKE_OFFSET: 10,
 
   COLORS: {
-    paper: '#F5F1E6',
+    paper: '#F4F1EA',
     paperGrid: 'rgba(35, 38, 41, 0.035)',
-    riverHalo: '#DCE7EB',
-    river: '#8FB3C2',
+    riverHalo: '#DFEAF0',
+    river: '#99BFCF',
     riverBank: '#769AA9',
-    hillFill: 'rgba(182, 169, 142, 0.16)',
-    hillStroke: 'rgba(140, 126, 106, 0.38)',
+    hillFill: 'rgba(175, 163, 140, 0.14)',
+    hillStroke: 'rgba(140, 128, 108, 0.28)',
     ink: '#232629',
     stationFill: '#FFFDF9',
     danger: '#D94E34',
-    bridgeDeck: '#5F5B52',
+    bridgeDeck: '#F4F1EA',
     tunnelPortal: '#3B3832',
   },
 };
+
+export const THEMES = {
+  day: {
+    bg: '#F4F1EA',
+    river: '#99BFCF',
+    riverHalo: '#DFEAF0',
+    hillFill: 'rgba(175, 163, 140, 0.14)',
+    hillStroke: 'rgba(140, 128, 108, 0.28)',
+    ink: '#232629',
+    stationFill: '#FFFDF9',
+    muted: '#6E6A61',
+    danger: '#D94E34',
+    bridgeStroke: '#7A7468',
+    bridgeDeck: '#F4F1EA',
+    queueHalo: 'rgba(244, 241, 234, 0.92)',
+    lineColors: ['#D94E34', '#2563EB', '#EAB308', '#16A34A', '#9333EA', '#0891B2'],
+  },
+  night: {
+    bg: '#161A22',
+    river: '#0D1117',
+    riverHalo: '#1D2430',
+    hillFill: 'rgba(255, 255, 255, 0.035)',
+    hillStroke: 'rgba(255, 255, 255, 0.10)',
+    ink: '#F1F5F9',
+    stationFill: '#1E2430',
+    muted: '#94A3B8',
+    danger: '#F87171',
+    bridgeStroke: '#64748B',
+    bridgeDeck: '#161A22',
+    queueHalo: 'rgba(22, 26, 34, 0.92)',
+    lineColors: ['#FF5A3D', '#3B82F6', '#FACC15', '#22C55E', '#A855F7', '#06B6D4'],
+  },
+};
+
+export function getThemePalette(state) {
+  return THEMES[state?.theme === 'night' ? 'night' : 'day'];
+}
+
+export function getLineColor(state, lineId) {
+  const pal = getThemePalette(state);
+  const idx = Number.isFinite(lineId) ? Math.abs(Math.floor(lineId)) % pal.lineColors.length : 0;
+  return pal.lineColors[idx];
+}
 
 export function mulberry32(seed) {
   let a = seed >>> 0;
@@ -124,11 +176,13 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     stations: [],
     isLoop: false,
     removingEdges: new Set(),
+    spine: null,
   }));
 
   return {
     seed,
     rng: mulberry32(seed),
+    theme: 'day',
 
     // Timing & Speed
     simTime: 0,
@@ -150,7 +204,15 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
 
     // Camera & Viewport
     viewport: { width: 1280, height: 780, dpr: 1 },
-    camera: { x: 0, y: 0, zoom: 1.0, targetZoom: 1.0 },
+    camera: {
+      x: 0,
+      y: 0,
+      zoom: 1.0,
+      targetX: 0,
+      targetY: 0,
+      targetZoom: 1.0,
+      userControlled: false,
+    },
 
     // Terrain
     river: { points: [], halfWidth: 26 },
@@ -182,6 +244,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
       bridge: 2,
       doubleTrack: 1,
       tunnel: 1,
+      interchange: 0,
     },
 
     // Onboarding
@@ -195,12 +258,14 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
 
     // Interactive State (used by input.js & renderer.js)
     interaction: {
-      mode: 'idle', // 'idle' | 'buildLine' | 'insertNode' | 'dragToken' | 'dragTrain' | 'dragUpgrade'
+      mode: 'idle', // 'idle' | 'buildLine' | 'insertNode' | 'dragToken' | 'dragTrain' | 'dragUpgrade' | 'pan'
       selectedTool: null, // optional click-to-place tool from dock
       hoveredStationId: null,
       hoveredCorridorKey: null,
       hoveredTrainId: null,
       hoveredTBar: null, // { lineId, end: 'start' | 'end', stationId }
+      spotlightLineId: null,
+      panStart: null,
       drag: null,
       hintText: '',
       hintTimer: 0,
@@ -209,110 +274,23 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
   };
 }
 
-const MAX_TRAIN_HISTORY_SPAN = CONFIG.MAX_CARS_PER_TRAIN * CONFIG.CAR_SPACING + 96;
-
-export function recordTrainHistory(train, x, y, angle, stepDist = 0) {
-  if (!train) return;
-  if (!Array.isArray(train.pathHistory)) {
-    train.pathHistory = [];
-  }
-  if (typeof train.totalTraveled !== 'number') {
-    train.totalTraveled = 0;
-  }
-
-  const distDelta = stepDist > 0 ? stepDist : 0;
-  if (train.pathHistory.length === 0) {
-    train.totalTraveled += distDelta;
-    train.pathHistory.push({ dist: train.totalTraveled, x, y, angle });
-    return;
-  }
-
-  if (distDelta <= 0) {
-    const last = train.pathHistory[train.pathHistory.length - 1];
-    last.x = x;
-    last.y = y;
-    last.angle = angle;
-    return;
-  }
-
-  train.totalTraveled += distDelta;
-  const last = train.pathHistory[train.pathHistory.length - 1];
-  if (train.totalTraveled - last.dist >= 2.0) {
-    train.pathHistory.push({ dist: train.totalTraveled, x, y, angle });
-  } else {
-    last.dist = train.totalTraveled;
-    last.x = x;
-    last.y = y;
-    last.angle = angle;
-  }
-
-  while (
-    train.pathHistory.length > 2 &&
-    train.pathHistory[1].dist < train.totalTraveled - MAX_TRAIN_HISTORY_SPAN
-  ) {
-    train.pathHistory.shift();
-  }
-}
-
 export function sampleTrainCarriagePose(train, backDistance) {
   if (!train) {
     return { x: 0, y: 0, angle: 0 };
   }
-  const hist = train.pathHistory;
+  if (Array.isArray(train.unitPoses) && train.unitPoses.length > 0) {
+    const idx = Math.min(
+      train.unitPoses.length - 1,
+      Math.max(0, Math.round(backDistance / CONFIG.CAR_SPACING))
+    );
+    const pose = train.unitPoses[idx];
+    return { x: pose.x, y: pose.y, angle: pose.angle };
+  }
   const baseAngle = train.angle || 0;
-  if (!Array.isArray(hist) || hist.length === 0) {
-    return {
-      x: (train.x || 0) - Math.cos(baseAngle) * backDistance,
-      y: (train.y || 0) - Math.sin(baseAngle) * backDistance,
-      angle: baseAngle,
-    };
-  }
-
-  const total = typeof train.totalTraveled === 'number'
-    ? train.totalTraveled
-    : hist[hist.length - 1].dist;
-  const targetDist = total - backDistance;
-
-  if (targetDist <= hist[0].dist) {
-    const first = hist[0];
-    const extra = first.dist - targetDist;
-    return {
-      x: first.x - Math.cos(first.angle) * extra,
-      y: first.y - Math.sin(first.angle) * extra,
-      angle: first.angle,
-    };
-  }
-
-  const last = hist[hist.length - 1];
-  if (targetDist >= last.dist) {
-    return { x: last.x, y: last.y, angle: last.angle };
-  }
-
-  // Binary search for segment [lo, lo + 1] containing targetDist
-  let lo = 0;
-  let hi = hist.length - 2;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    if (hist[mid].dist <= targetDist) {
-      lo = mid;
-    } else {
-      hi = mid - 1;
-    }
-  }
-
-  const a = hist[lo];
-  const b = hist[lo + 1];
-  const span = b.dist - a.dist;
-  const t = span > 1e-6 ? (targetDist - a.dist) / span : 0;
-
-  let angleDiff = b.angle - a.angle;
-  while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-  while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-
   return {
-    x: a.x + (b.x - a.x) * t,
-    y: a.y + (b.y - a.y) * t,
-    angle: a.angle + angleDiff * t,
+    x: (train.x || 0) - Math.cos(baseAngle) * backDistance,
+    y: (train.y || 0) - Math.sin(baseAngle) * backDistance,
+    angle: baseAngle,
   };
 }
 
@@ -338,6 +316,65 @@ export function screenToWorld(state, sx, sy) {
     x: state.camera.x + (sx - state.viewport.width * 0.5) / scale,
     y: state.camera.y + (sy - state.viewport.height * 0.5) / scale,
   };
+}
+
+export function zoomCameraAtScreenPoint(state, screenX, screenY, zoomFactor) {
+  const before = screenToWorld(state, screenX, screenY);
+  const nextZoom = Math.max(
+    CONFIG.MIN_ZOOM,
+    Math.min(CONFIG.MAX_ZOOM, state.camera.zoom * zoomFactor)
+  );
+  state.camera.zoom = nextZoom;
+  state.camera.targetZoom = nextZoom;
+
+  const scale = getEffectiveScale(state);
+  const newX = before.x - (screenX - state.viewport.width * 0.5) / scale;
+  const newY = before.y - (screenY - state.viewport.height * 0.5) / scale;
+
+  state.camera.x = Math.max(-1250, Math.min(1250, newX));
+  state.camera.y = Math.max(-780, Math.min(780, newY));
+  state.camera.targetX = state.camera.x;
+  state.camera.targetY = state.camera.y;
+  state.camera.userControlled = true;
+}
+
+export function panCameraByScreenDelta(state, dxScreen, dyScreen) {
+  const scale = getEffectiveScale(state);
+  state.camera.x = Math.max(-1250, Math.min(1250, state.camera.x - dxScreen / scale));
+  state.camera.y = Math.max(-780, Math.min(780, state.camera.y - dyScreen / scale));
+  state.camera.targetX = state.camera.x;
+  state.camera.targetY = state.camera.y;
+  state.camera.userControlled = true;
+}
+
+export function resetCameraToFit(state) {
+  state.camera.userControlled = false;
+  if (!state.stations || state.stations.length === 0) {
+    state.camera.targetX = 0;
+    state.camera.targetY = 0;
+    state.camera.targetZoom = 1.0;
+    return;
+  }
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const st of state.stations) {
+    if (st.x < minX) minX = st.x;
+    if (st.x > maxX) maxX = st.x;
+    if (st.y < minY) minY = st.y;
+    if (st.y > maxY) maxY = st.y;
+  }
+  const cx = (minX + maxX) * 0.5;
+  const cy = (minY + maxY) * 0.5;
+  const halfW = Math.max(430, (maxX - minX) * 0.5 + 140);
+  const halfH = Math.max(260, (maxY - minY) * 0.5 + 120);
+  const zoomX = (CONFIG.BASE_VIEW_WIDTH * 0.46) / halfW;
+  const zoomY = (CONFIG.BASE_VIEW_HEIGHT * 0.44) / halfH;
+
+  state.camera.targetX = cx;
+  state.camera.targetY = cy;
+  state.camera.targetZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(1.0, zoomX, zoomY));
 }
 
 export function showHint(state, text, duration = 2.2) {

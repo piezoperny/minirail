@@ -5,7 +5,9 @@ export function createFXState() {
     puffs: [],
     hops: [],
     floaters: [],
+    pulses: [],
     ripplesOffset: 0,
+    onboardingPhase: 0,
   };
 }
 
@@ -80,14 +82,41 @@ export function spawnFloatingToast(state, x, y, text, color) {
   return floater;
 }
 
+export function spawnWarningPulse(state, x, y, maxR = 38, color = '#D94E34') {
+  const fx = state?.fx;
+  if (!fx) return null;
+
+  const startR = 16;
+  const pulse = {
+    x,
+    y,
+    startR,
+    maxR: Math.max(startR + 4, maxR),
+    r: startR,
+    color: color ?? '#D94E34',
+    age: 0,
+    life: 0.9,
+  };
+
+  if (!Array.isArray(fx.pulses)) {
+    fx.pulses = [];
+  }
+  fx.pulses.push(pulse);
+  if (fx.pulses.length > 64) {
+    fx.pulses.splice(0, fx.pulses.length - 64);
+  }
+  return pulse;
+}
+
 export function stepFX(state, dt) {
   const fx = state?.fx;
   if (!fx || !Number.isFinite(dt) || dt <= 0) return;
 
   const clampedDt = Math.min(dt, 0.1);
 
-  // River current ripple phase
+  // River current ripple phase & wordless onboarding loop timer
   fx.ripplesOffset = (fx.ripplesOffset + clampedDt * 24) % 10000;
+  fx.onboardingPhase = ((fx.onboardingPhase || 0) + clampedDt * 0.45) % 1;
 
   // Exhaust & factory smoke puffs
   for (let i = fx.puffs.length - 1; i >= 0; i--) {
@@ -125,6 +154,21 @@ export function stepFX(state, dt) {
       continue;
     }
     f.y += f.vy * clampedDt;
+  }
+
+  // Expanding overcrowding warning pulses
+  if (Array.isArray(fx.pulses)) {
+    for (let i = fx.pulses.length - 1; i >= 0; i--) {
+      const pl = fx.pulses[i];
+      pl.age += clampedDt;
+      if (pl.age >= pl.life) {
+        fx.pulses.splice(i, 1);
+        continue;
+      }
+      const t = pl.age / pl.life;
+      const eased = 1 - (1 - t) * (1 - t);
+      pl.r = pl.startR + (pl.maxR - pl.startR) * eased;
+    }
   }
 
   // Station hover springs & pulse decay

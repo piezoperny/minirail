@@ -1,4 +1,4 @@
-import { CONFIG } from './state.js';
+import { CONFIG, edgeKey } from './state.js';
 
 function dist2(ax, ay, bx, by) {
   const dx = ax - bx;
@@ -136,6 +136,68 @@ export function computeHillIntervals(points, cumLengths, totalLength, hills) {
   return intervals;
 }
 
+export function computeRiverIntervals(points, cumLengths, totalLength, river) {
+  if (!river?.points?.length || !points || points.length < 2) return [];
+  const minS = CONFIG.STATION_RADIUS + 2;
+  const maxS = totalLength - (CONFIG.STATION_RADIUS + 2);
+  if (maxS <= minS) return [];
+
+  const threshold = (river.halfWidth || 25) + 9;
+  const step = 4;
+  const raw = [];
+  let inWater = false;
+  let startS = minS;
+
+  for (let s = minS; s <= maxS; s += step) {
+    const pt = samplePointAlongPolyline(points, cumLengths, s);
+    const overWater = distanceToRiver(river, pt.x, pt.y) <= threshold;
+    if (overWater && !inWater) {
+      inWater = true;
+      startS = s;
+    } else if (!overWater && inWater) {
+      inWater = false;
+      raw.push({ start: Math.max(minS, startS), end: Math.min(maxS, s) });
+    }
+  }
+  if (inWater) {
+    raw.push({ start: Math.max(minS, startS), end: maxS });
+  }
+
+  const merged = [];
+  for (const iv of raw) {
+    if (iv.end - iv.start < 2) continue;
+    const prev = merged[merged.length - 1];
+    if (prev && iv.start - prev.end < 8) {
+      prev.end = iv.end;
+    } else {
+      merged.push({ start: iv.start, end: iv.end });
+    }
+  }
+  return merged;
+}
+
+export function extractSubPolyline(points, cumLengths, startS, endS) {
+  if (!points || points.length < 2 || !cumLengths || cumLengths.length < 2) return [];
+  const total = cumLengths[cumLengths.length - 1];
+  const s0 = Math.max(0, startS);
+  const s1 = Math.min(total, endS);
+  if (s1 <= s0 + 0.5) return [];
+
+  const p0 = samplePointAlongPolyline(points, cumLengths, s0);
+  const out = [{ x: p0.x, y: p0.y }];
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const ci = cumLengths[i];
+    if (ci > s0 + 0.01 && ci < s1 - 0.01) {
+      out.push({ x: points[i].x, y: points[i].y });
+    }
+  }
+
+  const p1 = samplePointAlongPolyline(points, cumLengths, s1);
+  out.push({ x: p1.x, y: p1.y });
+  return out;
+}
+
 function buildFilletedElbow(ax, ay, mx, my, bx, by) {
   const d1 = Math.hypot(mx - ax, my - ay);
   const d2 = Math.hypot(bx - mx, by - my);
@@ -165,7 +227,12 @@ function buildFilletedElbow(ax, ay, mx, my, bx, by) {
   return pts;
 }
 
-export function buildOctilinearPoints(ax, ay, bx, by, river, hills) {
+function angleDiffRad(a, b) {
+  let d = Math.abs(a - b) % (Math.PI * 2);
+  return d > Math.PI ? Math.PI * 2 - d : d;
+}
+
+export function buildOctilinearPoints(ax, ay, bx, by, river, hills, context = null) {
   const dx = bx - ax;
   const dy = by - ay;
   const absX = Math.abs(dx);
@@ -185,12 +252,84 @@ export function buildOctilinearPoints(ax, ay, bx, by, river, hills) {
   const cand1 = buildFilletedElbow(ax, ay, m1.x, m1.y, bx, by);
   const cand2 = buildFilletedElbow(ax, ay, m2.x, m2.y, bx, by);
 
+  const clearanceSq = (CONFIG.STATION_RADIUS + 14) * (CONFIG.STATION_RADIUS + 14);
+  const portSpreadRad = (22 * Math.PI) / 180;
+
   const scoreCandidate = (pts) => {
     const cross = countRiverCrossings(pts, river);
     const { cumLengths, totalLength } = computePolylineLengths(pts);
     const intervals = computeHillIntervals(pts, cumLengths, totalLength, hills);
     const hillLen = intervals.reduce((acc, iv) => acc + (iv.end - iv.start), 0);
-    return cross * 10000 + hillLen;
+    let score = cross * 10000 + hillLen;
+
+    if (context) {
+      if (Array.isArray(context.stations)) {
+        for (const st of context.stations) {
+          if (Math.hypot(st.x - ax, st.y - ay) < 5) continue;
+          if (Math.hypot(st.x - bx, st.y - by) < 5) continue;
+          let minSq = Infinity;
+          for (let i = 0; i < pts.length - 1; i++) {
+            const dSq = pointToSegmentDistSq(
+              st.x,
+              st.y,
+              pts[i].x,
+              pts[i].y,
+              pts[i + 1].x,
+              pts[i + 1].y
+            );
+            if (dSq < minSq) minSq = dSq;
+          }
+          if (minSq < clearanceSq) {
+            score += 6500;
+          }
+        }
+      }
+
+      const n = pts.length;
+      const outAx = pts[1].x - pts[0].x;
+      const outAy = pts[1].y - pts[0].y;
+      const lenA = Math.hypot(outAx, outAy) || 1;
+      const txA = outAx / lenA;
+      const tyA = outAy / lenA;
+
+      const inBx = pts[n - 1].x - pts[n - 2].x;
+      const inBy = pts[n - 1].y - pts[n - 2].y;
+      const lenB = Math.hypot(inBx, inBy) || 1;
+      const txB = inBx / lenB;
+      const tyB = inBy / lenB;
+
+      if (context.inTangentAtA) {
+        const dotA = context.inTangentAtA.x * txA + context.inTangentAtA.y * tyA;
+        if (dotA < -0.05) {
+          score += 4500;
+        }
+      }
+      if (context.outTangentAtB) {
+        const dotB = txB * context.outTangentAtB.x + tyB * context.outTangentAtB.y;
+        if (dotB < -0.05) {
+          score += 4500;
+        }
+      }
+
+      if (Array.isArray(context.usedAnglesAtA)) {
+        const angA = Math.atan2(tyA, txA);
+        for (const ua of context.usedAnglesAtA) {
+          if (angleDiffRad(angA, ua) < portSpreadRad) {
+            score += 900;
+          }
+        }
+      }
+      if (Array.isArray(context.usedAnglesAtB)) {
+        const angB = Math.atan2(-tyB, -txB);
+        for (const ub of context.usedAnglesAtB) {
+          if (angleDiffRad(angB, ub) < portSpreadRad) {
+            score += 900;
+          }
+        }
+      }
+    }
+
+    return score;
   };
 
   return scoreCandidate(cand1) <= scoreCandidate(cand2) ? cand1 : cand2;
@@ -281,56 +420,7 @@ function generateHills(rng, river) {
   return hills;
 }
 
-function rectOverlapsStationPad(dx, dy, w, h, padRadius) {
-  const nearestX = Math.max(dx - w * 0.5, Math.min(0, dx + w * 0.5));
-  const nearestY = Math.max(dy - h * 0.5, Math.min(0, dy + h * 0.5));
-  return nearestX * nearestX + nearestY * nearestY < padRadius * padRadius;
-}
-
-function generateBuildingSeeds(rng) {
-  const seeds = [];
-  const padClearance = CONFIG.STATION_RADIUS + 4; // 20u >= STATION_RADIUS (16u)
-
-  for (let i = 0; i < 10; i++) {
-    let placed = null;
-    for (let attempt = 0; attempt < 40; attempt++) {
-      // Bias slightly away from the bottom nameplate zone while keeping a natural cluster
-      const angle = rng() * Math.PI * 2;
-      const dist = padClearance + 7 + rng() * 14;
-      const w = 7 + Math.floor(rng() * 6); // 7..12
-      const h = 7 + Math.floor(rng() * 5); // 7..11
-      const dx = Math.round(Math.cos(angle) * dist);
-      const dy = Math.round(Math.sin(angle) * dist);
-
-      if (rectOverlapsStationPad(dx, dy, w, h, padClearance)) continue;
-      // Leave breathing room for bottom nameplate pill
-      if (dy > 14 && dy < 36 && Math.abs(dx) < 24) continue;
-
-      const tooClose = seeds.some((s) => Math.hypot(s.dx - dx, s.dy - dy) < 10);
-      if (tooClose) continue;
-
-      placed = { dx, dy, w, h, roof: Math.floor(rng() * 3) };
-      break;
-    }
-
-    if (!placed) {
-      const fallbackAngle = (i / 10) * Math.PI * 2 + 0.3;
-      const dist = padClearance + 12 + (i % 2) * 6;
-      placed = {
-        dx: Math.round(Math.cos(fallbackAngle) * dist),
-        dy: Math.round(Math.sin(fallbackAngle) * dist),
-        w: 8,
-        h: 8,
-        roof: i % 3,
-      };
-    }
-    seeds.push(placed);
-  }
-
-  return seeds;
-}
-
-function createStation(id, x, y, spec, rng) {
+function createStation(id, x, y, spec) {
   const { kind, subtype, name, tier = 1, cityCode = null, crestColor = null } = spec;
 
   let capacity = 6;
@@ -357,7 +447,9 @@ function createStation(id, x, y, spec, rng) {
     crestColor,
     goodsProgress: 0,
     goodsTarget,
-    buildingSeeds: kind === 'settlement' ? generateBuildingSeeds(rng) : [],
+    buildingSeeds: [],
+    isInterchange: false,
+    queueAngle: 0,
     inputBuffer: 0,
     processProgress: 0,
     capacity,
@@ -655,7 +747,10 @@ export function spawnNextStation(state) {
 }
 
 export function updateTargetCameraZoom(state) {
+  if (state.camera?.userControlled) return;
   if (state.stations.length === 0) {
+    state.camera.targetX = 0;
+    state.camera.targetY = 0;
     state.camera.targetZoom = 1.0;
     return;
   }
@@ -667,5 +762,323 @@ export function updateTargetCameraZoom(state) {
   }
   const zoomX = (CONFIG.BASE_VIEW_WIDTH * 0.46) / maxAbsX;
   const zoomY = (CONFIG.BASE_VIEW_HEIGHT * 0.44) / maxAbsY;
-  state.camera.targetZoom = Math.max(0.55, Math.min(1.0, zoomX, zoomY));
+  state.camera.targetX = 0;
+  state.camera.targetY = 0;
+  state.camera.targetZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(1.0, zoomX, zoomY));
+}
+
+function computeStationPassFillet(prevLeg, nextLeg) {
+  if (prevLeg.length < 2 || nextLeg.length < 2) return null;
+  const S = prevLeg[prevLeg.length - 1];
+  const pBefore = prevLeg[prevLeg.length - 2];
+  const pAfter = nextLeg[1];
+
+  const d1 = Math.hypot(S.x - pBefore.x, S.y - pBefore.y);
+  const d2 = Math.hypot(pAfter.x - S.x, pAfter.y - S.y);
+  if (d1 < 8 || d2 < 8) return null;
+
+  const u1x = (S.x - pBefore.x) / d1;
+  const u1y = (S.y - pBefore.y) / d1;
+  const u2x = (pAfter.x - S.x) / d2;
+  const u2y = (pAfter.y - S.y) / d2;
+
+  const cosTheta = u1x * u2x + u1y * u2y;
+  // Apply smooth corner fillet on 45°–135° bends (~23° to ~148°)
+  if (cosTheta <= -0.85 || cosTheta >= 0.92) return null;
+
+  const r = Math.min(CONFIG.STATION_PASS_FILLET, d1 * 0.42, d2 * 0.42);
+  if (r < 4) return null;
+
+  const pStart = { x: S.x - u1x * r, y: S.y - u1y * r };
+  const pEnd = { x: S.x + u2x * r, y: S.y + u2y * r };
+  const steps = 6;
+  const curve = [];
+  for (let k = 0; k <= steps; k++) {
+    const t = k / steps;
+    const omt = 1 - t;
+    curve.push({
+      x: omt * omt * pStart.x + 2 * omt * t * S.x + t * t * pEnd.x,
+      y: omt * omt * pStart.y + 2 * omt * t * S.y + t * t * pEnd.y,
+    });
+  }
+  return { curve, midIdx: steps >> 1 };
+}
+
+export function buildLineSpine(state, line) {
+  const isLoop = !!line?.isLoop;
+  if (!line || !Array.isArray(line.stations) || line.stations.length < 2) {
+    return { points: [], cumLengths: [0], totalLength: 0, stationU: [], isLoop };
+  }
+
+  const n = line.stations.length;
+  const legCount = isLoop ? n : n - 1;
+  const legs = [];
+
+  for (let i = 0; i < legCount; i++) {
+    const aId = line.stations[i];
+    const bId = line.stations[(i + 1) % n];
+    const corr = state.corridors?.get(edgeKey(aId, bId));
+    if (corr && Array.isArray(corr.points) && corr.points.length >= 2) {
+      const ordered = corr.aId === aId ? corr.points : corr.points.slice().reverse();
+      legs.push(ordered.map((p) => ({ x: p.x, y: p.y })));
+    } else {
+      const stA = state.stationById?.get(aId);
+      const stB = state.stationById?.get(bId);
+      if (!stA || !stB) {
+        return { points: [], cumLengths: [0], totalLength: 0, stationU: [], isLoop };
+      }
+      legs.push([
+        { x: stA.x, y: stA.y },
+        { x: stB.x, y: stB.y },
+      ]);
+    }
+  }
+
+  const junctions = new Array(n).fill(null);
+  const startJ = isLoop ? 0 : 1;
+  const endJ = isLoop ? n : n - 1;
+  for (let j = startJ; j < endJ; j++) {
+    const prevLeg = legs[(j - 1 + legCount) % legCount];
+    const nextLeg = legs[j];
+    junctions[j] = computeStationPassFillet(prevLeg, nextLeg);
+  }
+
+  const points = [];
+  const stationPointIndices = new Array(n).fill(0);
+
+  const pushUnique = (pt) => {
+    const last = points[points.length - 1];
+    if (!last || Math.hypot(pt.x - last.x, pt.y - last.y) > 0.01) {
+      points.push({ x: pt.x, y: pt.y });
+    }
+  };
+
+  if (isLoop && junctions[0]) {
+    const f0 = junctions[0];
+    stationPointIndices[0] = 0;
+    for (let k = f0.midIdx; k < f0.curve.length; k++) {
+      pushUnique(f0.curve[k]);
+    }
+  } else {
+    pushUnique(legs[0][0]);
+    stationPointIndices[0] = 0;
+  }
+
+  for (let i = 0; i < legCount; i++) {
+    const leg = legs[i];
+    const hasStartFillet = i === 0 ? isLoop && !!junctions[0] : !!junctions[i];
+    const nextJ = (i + 1) % n;
+    const hasEndFillet = nextJ === 0 ? isLoop && !!junctions[0] : !!junctions[nextJ];
+
+    const innerStart = 1;
+    const innerEnd = leg.length - 1;
+    for (let k = innerStart; k < innerEnd; k++) {
+      if (hasStartFillet && k === 1 && Math.hypot(leg[k].x - leg[0].x, leg[k].y - leg[0].y) < 1) {
+        continue;
+      }
+      pushUnique(leg[k]);
+    }
+
+    if (nextJ === 0) {
+      if (isLoop && junctions[0]) {
+        const f0 = junctions[0];
+        for (let k = 0; k <= f0.midIdx; k++) {
+          pushUnique(f0.curve[k]);
+        }
+      } else {
+        pushUnique(leg[leg.length - 1]);
+      }
+    } else if (hasEndFillet) {
+      const f = junctions[nextJ];
+      for (let k = 0; k < f.curve.length; k++) {
+        pushUnique(f.curve[k]);
+        if (k === f.midIdx) {
+          stationPointIndices[nextJ] = points.length - 1;
+        }
+      }
+    } else {
+      pushUnique(leg[leg.length - 1]);
+      stationPointIndices[nextJ] = points.length - 1;
+    }
+  }
+
+  const { cumLengths, totalLength } = computePolylineLengths(points);
+  const stationU = stationPointIndices.map((idx) => cumLengths[idx] ?? 0);
+
+  return { points, cumLengths, totalLength, stationU, isLoop };
+}
+
+export function samplePoseOnSpine(
+  spine,
+  u,
+  wheelbase = CONFIG.BOGIE_WHEELBASE,
+  lateralOffset = 0
+) {
+  if (!spine || !spine.points || spine.points.length < 2 || spine.totalLength <= 0) {
+    return { x: 0, y: 0, angle: 0, tx: 1, ty: 0, nx: 0, ny: 1 };
+  }
+
+  const total = spine.totalLength;
+  const wrapOrClamp = (s) => {
+    if (spine.isLoop) {
+      return ((s % total) + total) % total;
+    }
+    return Math.max(0, Math.min(total, s));
+  };
+
+  const half = wheelbase * 0.5;
+  const uFront = wrapOrClamp(u + half);
+  const uRear = wrapOrClamp(u - half);
+
+  const pFront = samplePointAlongPolyline(spine.points, spine.cumLengths, uFront);
+  const pRear = samplePointAlongPolyline(spine.points, spine.cumLengths, uRear);
+
+  let dx = pFront.x - pRear.x;
+  let dy = pFront.y - pRear.y;
+  let len = Math.hypot(dx, dy);
+
+  if (len < 1e-4) {
+    const pCenter = samplePointAlongPolyline(spine.points, spine.cumLengths, wrapOrClamp(u));
+    dx = pCenter.tx;
+    dy = pCenter.ty;
+    len = 1;
+  }
+
+  const tx = dx / len;
+  const ty = dy / len;
+  const nx = -ty;
+  const ny = tx;
+
+  const cx = (pFront.x + pRear.x) * 0.5 + nx * lateralOffset;
+  const cy = (pFront.y + pRear.y) * 0.5 + ny * lateralOffset;
+
+  return {
+    x: cx,
+    y: cy,
+    angle: Math.atan2(ty, tx),
+    tx,
+    ty,
+    nx,
+    ny,
+  };
+}
+
+export function computeTrainUnitPoses(
+  spine,
+  consistStartU,
+  unitCount,
+  direction,
+  lateralOffset = 0
+) {
+  const count = Math.max(1, unitCount | 0);
+  const poses = [];
+  const forward = direction >= 0;
+
+  for (let i = 0; i < count; i++) {
+    const k = forward ? count - 1 - i : i;
+    const u = consistStartU + k * CONFIG.CAR_SPACING;
+    const pose = samplePoseOnSpine(spine, u, CONFIG.BOGIE_WHEELBASE, lateralOffset);
+    const angle = forward ? pose.angle : Math.atan2(-pose.ty, -pose.tx);
+    poses.push({ x: pose.x, y: pose.y, angle });
+  }
+
+  return poses;
+}
+
+export function getLineTBarPose(state, line, endSide) {
+  if (!line || !Array.isArray(line.stations) || line.stations.length < 2 || line.isLoop) {
+    return null;
+  }
+  const spine = line.spine && line.spine.points?.length >= 2
+    ? line.spine
+    : buildLineSpine(state, line);
+  if (!spine || spine.points.length < 2 || spine.totalLength <= 0) {
+    return null;
+  }
+
+  const isStart = endSide === 'start';
+  const stationId = isStart
+    ? line.stations[0]
+    : line.stations[line.stations.length - 1];
+  const st = state.stationById?.get(stationId);
+  if (!st) return null;
+
+  const sample = samplePointAlongPolyline(
+    spine.points,
+    spine.cumLengths,
+    isStart ? 0 : spine.totalLength
+  );
+  const ux = isStart ? -sample.tx : sample.tx;
+  const uy = isStart ? -sample.ty : sample.ty;
+  const px = -uy;
+  const py = ux;
+
+  return {
+    x: st.x + ux * CONFIG.T_BAR_OFFSET,
+    y: st.y + uy * CONFIG.T_BAR_OFFSET,
+    ux,
+    uy,
+    px,
+    py,
+    stationId,
+  };
+}
+
+export function computeStationQueueAngle(state, station) {
+  if (!station) return 0;
+
+  const incidentAngles = [];
+  if (state?.corridors) {
+    for (const corr of state.corridors.values()) {
+      if (!corr || !Array.isArray(corr.points) || corr.points.length < 2) continue;
+      if (corr.aId === station.id) {
+        const dx = corr.points[1].x - corr.points[0].x;
+        const dy = corr.points[1].y - corr.points[0].y;
+        incidentAngles.push(Math.atan2(dy, dx));
+      } else if (corr.bId === station.id) {
+        const n = corr.points.length;
+        const dx = corr.points[n - 2].x - corr.points[n - 1].x;
+        const dy = corr.points[n - 2].y - corr.points[n - 1].y;
+        incidentAngles.push(Math.atan2(dy, dx));
+      }
+    }
+  }
+
+  const probeDist = CONFIG.STATION_RADIUS + 28;
+  const clearAngleRad = (55 * Math.PI) / 180;
+  let bestAngle = 0;
+  let bestScore = Infinity;
+
+  for (let k = 0; k < 8; k++) {
+    const ang = (k * Math.PI) / 4;
+    const px = station.x + Math.cos(ang) * probeDist;
+    const py = station.y + Math.sin(ang) * probeDist;
+
+    let score = k === 0 ? 0 : k === 1 || k === 7 ? 5 : 12;
+
+    for (const inc of incidentAngles) {
+      const diff = angleDiffRad(ang, inc);
+      if (diff < clearAngleRad) {
+        score += 1000 * (1 - diff / clearAngleRad);
+      }
+    }
+
+    if (state?.river?.points?.length) {
+      const dRiver = distanceToRiver(state.river, px, py);
+      if (dRiver < (state.river.halfWidth || 25) + 24) {
+        score += 800;
+      }
+    }
+
+    if (Math.abs(px) > 1050 || Math.abs(py) > 600) {
+      score += 400;
+    }
+
+    if (score < bestScore) {
+      bestScore = score;
+      bestAngle = ang;
+    }
+  }
+
+  return bestAngle;
 }

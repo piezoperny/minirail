@@ -1,13 +1,66 @@
-import { CONFIG, edgeKey, orderedPair, recordTrainHistory } from './state.js';
-import { spawnPuff, spawnTokenHop, spawnFloatingToast } from './fx.js';
+import { CONFIG, edgeKey, orderedPair } from './state.js';
+import { spawnPuff, spawnTokenHop, spawnFloatingToast, spawnWarningPulse } from './fx.js';
 import {
+  buildLineSpine,
   buildOctilinearPoints,
   computeHillIntervals,
   computePolylineLengths,
+  computeRiverIntervals,
+  computeStationQueueAngle,
+  computeTrainUnitPoses,
   countRiverCrossings,
   samplePointAlongPolyline,
   spawnNextStation,
 } from './mapGen.js';
+
+function markLineSpineDirty(line) {
+  if (line) line.spine = null;
+}
+
+function ensureLineSpine(state, line) {
+  if (!line || !Array.isArray(line.stations) || line.stations.length < 2) {
+    if (line) line.spine = null;
+    return null;
+  }
+  const expectedStations = line.stations.length;
+  const isLoop = !!line.isLoop;
+  if (
+    !line.spine ||
+    !Array.isArray(line.spine.points) ||
+    line.spine.points.length < 2 ||
+    !Array.isArray(line.spine.stationU) ||
+    line.spine.stationU.length !== expectedStations ||
+    !!line.spine.isLoop !== isLoop
+  ) {
+    line.spine = buildLineSpine(state, line);
+  }
+  return line.spine;
+}
+
+function collectUsedAnglesAtStation(state, stationId) {
+  const angles = [];
+  if (!state?.corridors) return angles;
+  for (const corr of state.corridors.values()) {
+    if (!corr || !Array.isArray(corr.points) || corr.points.length < 2) continue;
+    if (corr.aId === stationId) {
+      angles.push(Math.atan2(corr.points[1].y - corr.points[0].y, corr.points[1].x - corr.points[0].x));
+    } else if (corr.bId === stationId) {
+      const n = corr.points.length;
+      angles.push(
+        Math.atan2(corr.points[n - 2].y - corr.points[n - 1].y, corr.points[n - 2].x - corr.points[n - 1].x)
+      );
+    }
+  }
+  return angles;
+}
+
+function buildCorridorContext(state, aId, bId) {
+  return {
+    stations: state.stations || [],
+    usedAnglesAtA: collectUsedAnglesAtStation(state, aId),
+    usedAnglesAtB: collectUsedAnglesAtStation(state, bId),
+  };
+}
 
 function createToken(state, kind, extra = {}) {
   const service = kind === 'raw' || kind === 'goods' ? 'freight' : 'express';
@@ -57,9 +110,11 @@ export function getOrCreateCorridor(state, id1, id2) {
   }
   const stA = state.stationById.get(aId);
   const stB = state.stationById.get(bId);
-  const points = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, state.river, state.hills);
+  const context = buildCorridorContext(state, aId, bId);
+  const points = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, state.river, state.hills, context);
   const { cumLengths, totalLength } = computePolylineLengths(points);
   const riverCrossings = countRiverCrossings(points, state.river);
+  const riverIntervals = computeRiverIntervals(points, cumLengths, totalLength, state.river);
   const hillIntervals = computeHillIntervals(points, cumLengths, totalLength, state.hills);
 
   const corridor = {
@@ -70,6 +125,7 @@ export function getOrCreateCorridor(state, id1, id2) {
     cumLengths,
     totalLength,
     riverCrossings,
+    riverIntervals,
     hasBridge: false,
     hillIntervals,
     hasTunnel: false,
@@ -82,6 +138,8 @@ export function getOrCreateCorridor(state, id1, id2) {
     lastServedDir: null,
   };
   state.corridors.set(key, corridor);
+  if (stA) stA.queueAngle = computeStationQueueAngle(state, stA);
+  if (stB) stB.queueAngle = computeStationQueueAngle(state, stB);
   return corridor;
 }
 
@@ -116,9 +174,12 @@ export function canAddCorridorForLine(state, id1, id2) {
     }
     return { ok: true };
   }
-  const stA = state.stationById.get(id1);
-  const stB = state.stationById.get(id2);
-  const pts = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, state.river, state.hills);
+  const [aId, bId] = orderedPair(id1, id2);
+  const stA = state.stationById.get(aId);
+  const stB = state.stationById.get(bId);
+  if (!stA || !stB) return { ok: false, reason: 'Station not found' };
+  const context = buildCorridorContext(state, aId, bId);
+  const pts = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, state.river, state.hills, context);
   const crossings = countRiverCrossings(pts, state.river);
   if (crossings > 0 && state.inventory.bridge <= 0) {
     return { ok: false, reason: 'No Bridges left!' };
@@ -135,6 +196,7 @@ function activateCorridorForLine(state, line, id1, id2) {
   }
   corridor.activeLineIds.add(line.id);
   line.removingEdges.delete(corridor.key);
+  markLineSpineDirty(line);
   return true;
 }
 
@@ -154,6 +216,10 @@ function releaseCorridorIfUnused(state, corridor) {
       corridor.isDoubleTrack = false;
     }
     state.corridors.delete(corridor.key);
+    const stA = state.stationById.get(corridor.aId);
+    const stB = state.stationById.get(corridor.bId);
+    if (stA) stA.queueAngle = computeStationQueueAngle(state, stA);
+    if (stB) stB.queueAngle = computeStationQueueAngle(state, stB);
   }
 }
 
@@ -307,15 +373,23 @@ export function insertStationIntoLine(state, lineId, segAId, segBId, newStationI
   deactivateLineEdge(state, line, segAId, segBId);
   activateCorridorForLine(state, line, segAId, newStationId);
   activateCorridorForLine(state, line, newStationId, segBId);
+  markLineSpineDirty(line);
+  for (const tr of state.trains) {
+    if (tr.lineId === lineId) updateTrainSpinePoses(state, tr);
+  }
   return { ok: true };
 }
 
 function reconcileTrainsAfterLineShrink(state, lineId) {
   const line = state.lines[lineId];
+  if (!line) return;
   if (line.stations.length >= 2) {
     for (const tr of state.trains) {
-      if (tr.lineId === lineId && tr.state !== 'traversing') {
-        tr.stationIndex = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+      if (tr.lineId === lineId) {
+        if (tr.state !== 'traversing') {
+          tr.stationIndex = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+        }
+        updateTrainSpinePoses(state, tr);
       }
     }
     return;
@@ -337,6 +411,7 @@ export function trimLineEnd(state, lineId, endSide) {
     const firstId = line.stations[0];
     const lastId = line.stations[line.stations.length - 1];
     line.isLoop = false;
+    markLineSpineDirty(line);
     deactivateLineEdge(state, line, lastId, firstId);
     reconcileTrainsAfterLineShrink(state, lineId);
     return { ok: true };
@@ -345,6 +420,7 @@ export function trimLineEnd(state, lineId, endSide) {
   if (line.stations.length === 2) {
     const [a, b] = line.stations;
     line.stations = [];
+    markLineSpineDirty(line);
     deactivateLineEdge(state, line, a, b);
     reconcileTrainsAfterLineShrink(state, lineId);
     return { ok: true };
@@ -353,6 +429,7 @@ export function trimLineEnd(state, lineId, endSide) {
   if (endSide === 'end') {
     const b = line.stations.pop();
     const a = line.stations[line.stations.length - 1];
+    markLineSpineDirty(line);
     deactivateLineEdge(state, line, a, b);
   } else {
     const a = line.stations.shift();
@@ -360,9 +437,103 @@ export function trimLineEnd(state, lineId, endSide) {
     for (const tr of state.trains) {
       if (tr.lineId === lineId && tr.stationIndex > 0) tr.stationIndex -= 1;
     }
+    markLineSpineDirty(line);
     deactivateLineEdge(state, line, a, b);
   }
   reconcileTrainsAfterLineShrink(state, lineId);
+  return { ok: true };
+}
+
+export function removeStationFromLine(state, lineId, stationId) {
+  const line = state.lines[lineId];
+  if (!line) return { ok: false, reason: 'Line not found' };
+  const idx = line.stations.indexOf(stationId);
+  if (idx === -1) return { ok: false, reason: 'Station not on line' };
+
+  const n = line.stations.length;
+  if (!line.isLoop && n <= 2) {
+    return clearLine(state, lineId);
+  }
+
+  if (line.isLoop) {
+    const prevId = line.stations[(idx - 1 + n) % n];
+    const nextId = line.stations[(idx + 1) % n];
+    if (n === 3) {
+      line.stations.splice(idx, 1);
+      line.isLoop = false;
+      for (const tr of state.trains) {
+        if (tr.lineId === lineId && tr.state !== 'traversing') {
+          if (tr.stationIndex > idx) tr.stationIndex -= 1;
+          tr.stationIndex = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+        }
+      }
+      markLineSpineDirty(line);
+      deactivateLineEdge(state, line, prevId, stationId);
+      deactivateLineEdge(state, line, stationId, nextId);
+      reconcileTrainsAfterLineShrink(state, lineId);
+      return { ok: true };
+    }
+
+    const check = canAddCorridorForLine(state, prevId, nextId);
+    if (!check.ok) return check;
+
+    line.stations.splice(idx, 1);
+    for (const tr of state.trains) {
+      if (tr.lineId === lineId && tr.state !== 'traversing') {
+        if (tr.stationIndex > idx) tr.stationIndex -= 1;
+        tr.stationIndex = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+      }
+    }
+    markLineSpineDirty(line);
+    deactivateLineEdge(state, line, prevId, stationId);
+    deactivateLineEdge(state, line, stationId, nextId);
+    activateCorridorForLine(state, line, prevId, nextId);
+    reconcileTrainsAfterLineShrink(state, lineId);
+    return { ok: true };
+  }
+
+  if (idx === 0) return trimLineEnd(state, lineId, 'start');
+  if (idx === n - 1) return trimLineEnd(state, lineId, 'end');
+
+  const prevId = line.stations[idx - 1];
+  const nextId = line.stations[idx + 1];
+  const check = canAddCorridorForLine(state, prevId, nextId);
+  if (!check.ok) return check;
+
+  line.stations.splice(idx, 1);
+  for (const tr of state.trains) {
+    if (tr.lineId === lineId && tr.state !== 'traversing') {
+      if (tr.stationIndex > idx) tr.stationIndex -= 1;
+      tr.stationIndex = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+    }
+  }
+  markLineSpineDirty(line);
+  deactivateLineEdge(state, line, prevId, stationId);
+  deactivateLineEdge(state, line, stationId, nextId);
+  activateCorridorForLine(state, line, prevId, nextId);
+  reconcileTrainsAfterLineShrink(state, lineId);
+  return { ok: true };
+}
+
+export function clearLine(state, lineId) {
+  const line = state.lines[lineId];
+  if (!line) return { ok: false, reason: 'Line not found' };
+
+  for (let i = state.trains.length - 1; i >= 0; i--) {
+    if (state.trains[i].lineId === lineId) {
+      reclaimTrainToInventory(state, state.trains[i].id);
+    }
+  }
+
+  const edges = getLineEdges(line);
+  line.stations = [];
+  line.isLoop = false;
+  line.removingEdges.clear();
+  markLineSpineDirty(line);
+
+  for (const [u, v] of edges) {
+    deactivateLineEdge(state, line, u, v);
+  }
   return { ok: true };
 }
 
@@ -370,16 +541,20 @@ export function removeSegmentFromLine(state, lineId, id1, id2) {
   const line = state.lines[lineId];
   if (!line || line.stations.length < 2) return { ok: false };
   const n = line.stations.length;
-  const firstId = line.stations[0];
-  const lastId = line.stations[n - 1];
+  const idx1 = line.stations.indexOf(id1);
+  const idx2 = line.stations.indexOf(id2);
+  if (idx1 === -1 || idx2 === -1) return { ok: false, reason: 'Segment not on line' };
 
   if (line.isLoop) {
-    const idx1 = line.stations.indexOf(id1);
-    const idx2 = line.stations.indexOf(id2);
-    if (idx1 === -1 || idx2 === -1) return { ok: false };
-    if ((idx1 === n - 1 && idx2 === 0) || (idx2 === n - 1 && idx1 === 0)) {
+    const isClosing = (idx1 === n - 1 && idx2 === 0) || (idx2 === n - 1 && idx1 === 0);
+    if (!isClosing && Math.abs(idx1 - idx2) !== 1) {
+      return { ok: false, reason: 'Segment not on line' };
+    }
+    if (isClosing) {
       line.isLoop = false;
+      markLineSpineDirty(line);
       deactivateLineEdge(state, line, id1, id2);
+      reconcileTrainsAfterLineShrink(state, lineId);
       return { ok: true };
     }
     const cutAfter = (idx1 + 1) % n === idx2 ? idx1 : idx2;
@@ -388,26 +563,40 @@ export function removeSegmentFromLine(state, lineId, id1, id2) {
       ...line.stations.slice(0, cutAfter + 1),
     ];
     line.isLoop = false;
+    markLineSpineDirty(line);
     deactivateLineEdge(state, line, id1, id2);
     reconcileTrainsAfterLineShrink(state, lineId);
     return { ok: true };
   }
 
-  if (n === 2 || edgeKey(id1, id2) === edgeKey(line.stations[n - 2], lastId)) {
+  if (Math.abs(idx1 - idx2) !== 1) {
+    return { ok: false, reason: 'Segment not on line' };
+  }
+
+  const idx = Math.min(idx1, idx2);
+  if (n === 2 || idx === n - 2) {
     return trimLineEnd(state, lineId, 'end');
   }
-  if (edgeKey(id1, id2) === edgeKey(firstId, line.stations[1])) {
+  if (idx === 0) {
     return trimLineEnd(state, lineId, 'start');
   }
 
-  const idx = Math.min(line.stations.indexOf(id1), line.stations.indexOf(id2));
-  if (idx < 0) return { ok: false };
+  // Interior segment: bypass the station closer to an endpoint so we don't wipe half a chain
+  const targetIdx = idx <= (n - 2) / 2 ? idx : idx + 1;
+  const bypassRes = removeStationFromLine(state, lineId, line.stations[targetIdx]);
+  if (bypassRes.ok) {
+    return bypassRes;
+  }
+
+  // Fallback if bypass cannot cross a river without a bridge: detach shorter end cleanly
   if (idx + 1 <= n / 2) {
-    while (line.stations.length > n - (idx + 1)) {
+    const trims = idx + 1;
+    for (let t = 0; t < trims && line.stations.length >= 2; t++) {
       trimLineEnd(state, lineId, 'start');
     }
   } else {
-    while (line.stations.length > idx + 1) {
+    const trims = n - (idx + 1);
+    for (let t = 0; t < trims && line.stations.length >= 2; t++) {
       trimLineEnd(state, lineId, 'end');
     }
   }
@@ -415,6 +604,91 @@ export function removeSegmentFromLine(state, lineId, id1, id2) {
 }
 
 // ---------- Fleet & Upgrade Helpers ----------
+
+function updateTrainSpinePoses(state, tr) {
+  const line = state.lines[tr.lineId];
+  const spine = ensureLineSpine(state, line);
+  const unitCount = 1 + (tr.cars ?? CONFIG.TRAIN_DEFAULT_CARS);
+  if (!spine || spine.points.length < 2 || spine.totalLength <= 0) {
+    const st =
+      line && line.stations.length > 0
+        ? state.stationById.get(
+            line.stations[Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex))]
+          )
+        : null;
+    const x = st ? st.x : tr.x || 0;
+    const y = st ? st.y : tr.y || 0;
+    const angle = tr.angle || 0;
+    tr.consistStartU = 0;
+    tr.spineTotalLength = 0;
+    tr.unitPoses = Array.from({ length: unitCount }, (_, i) => ({
+      x: x - Math.cos(angle) * i * CONFIG.CAR_SPACING,
+      y: y - Math.sin(angle) * i * CONFIG.CAR_SPACING,
+      angle,
+    }));
+    tr.x = tr.unitPoses[0].x;
+    tr.y = tr.unitPoses[0].y;
+    tr.angle = tr.unitPoses[0].angle;
+    return;
+  }
+
+  const total = spine.totalLength;
+  const span = (unitCount - 1) * CONFIG.CAR_SPACING;
+  const maxStartU = Math.max(0, total - span);
+  const clampOrWrap = (u) => {
+    if (spine.isLoop) {
+      return ((u % total) + total) % total;
+    }
+    return Math.max(0, Math.min(maxStartU, u));
+  };
+
+  let consistStartU = 0;
+  if (tr.state === 'traversing' && tr.corridorKey) {
+    const corridor = state.corridors.get(tr.corridorKey);
+    const fromIdx = line.stations.indexOf(tr.fromStationId);
+    const toIdx = line.stations.indexOf(tr.toStationId);
+    if (corridor && fromIdx >= 0 && toIdx >= 0) {
+      const uFrom = spine.stationU[fromIdx] ?? 0;
+      const uTo = spine.stationU[toIdx] ?? 0;
+      const frac =
+        corridor.totalLength > 0 ? Math.max(0, Math.min(1, tr.s / corridor.totalLength)) : 0;
+      if (spine.isLoop) {
+        const deltaU =
+          tr.direction >= 0
+            ? uTo >= uFrom
+              ? uTo - uFrom
+              : total - uFrom + uTo
+            : -(uFrom >= uTo ? uFrom - uTo : total - uTo + uFrom);
+        consistStartU = clampOrWrap(uFrom - span * 0.5 + deltaU * frac);
+      } else {
+        const startU = clampOrWrap(uFrom - span * 0.5);
+        const endU = clampOrWrap(uTo - span * 0.5);
+        consistStartU = startU + (endU - startU) * frac;
+      }
+    } else {
+      const idx = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+      const stU = spine.stationU[idx] ?? 0;
+      consistStartU = clampOrWrap(stU - span * 0.5);
+    }
+  } else {
+    const idx = Math.max(0, Math.min(line.stations.length - 1, tr.stationIndex));
+    const stU = spine.stationU[idx] ?? 0;
+    consistStartU = clampOrWrap(stU - span * 0.5);
+  }
+
+  tr.consistStartU = consistStartU;
+  tr.spineTotalLength = total;
+  tr.unitPoses = computeTrainUnitPoses(
+    spine,
+    consistStartU,
+    unitCount,
+    tr.direction,
+    tr.lateralOffset || 0
+  );
+  tr.x = tr.unitPoses[0].x;
+  tr.y = tr.unitPoses[0].y;
+  tr.angle = tr.unitPoses[0].angle;
+}
 
 function computeInitialTrainAngle(state, line, stationIndex, direction) {
   const next = getNextStop(line, stationIndex, direction);
@@ -449,6 +723,7 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
   const st = state.stationById.get(line.stations[stationIndex]);
   const direction = stationIndex === line.stations.length - 1 ? -1 : 1;
   const angle = computeInitialTrainAngle(state, line, stationIndex, direction);
+  const dwellMult = st?.isInterchange ? CONFIG.INTERCHANGE_DWELL_MULT : 1;
   const train = {
     id: state.nextTrainId++,
     type,
@@ -458,7 +733,7 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
     state: 'atStation',
     stationIndex,
     direction,
-    dwellTimer: 0.25,
+    dwellTimer: 0.25 * dwellMult,
     exchangedAtStop: false,
     corridorKey: null,
     corridorDir: 'AtoB',
@@ -466,8 +741,9 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
     toStationId: null,
     s: 0,
     currentSpeed: 0,
-    totalTraveled: 0,
-    pathHistory: [],
+    consistStartU: 0,
+    spineTotalLength: 0,
+    unitPoses: [],
     exhaustTimer: 0,
     lane: 0,
     lateralOffset: 0,
@@ -475,7 +751,7 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
     y: st.y,
     angle,
   };
-  recordTrainHistory(train, st.x, st.y, angle, 0);
+  updateTrainSpinePoses(state, train);
   state.trains.push(train);
   return { ok: true, train };
 }
@@ -489,6 +765,7 @@ export function attachCarToTrain(state, trainId) {
   }
   state.inventory.car -= 1;
   tr.cars += 1;
+  updateTrainSpinePoses(state, tr);
   return { ok: true };
 }
 
@@ -537,16 +814,41 @@ export function moveTrainToLine(state, trainId, targetLineId, stationId = null) 
   }
   tr.stationIndex = sIdx;
   tr.direction = sIdx === line.stations.length - 1 ? -1 : 1;
-  tr.dwellTimer = 0.25;
   const st = state.stationById.get(line.stations[sIdx]);
+  const dwellMult = st?.isInterchange ? CONFIG.INTERCHANGE_DWELL_MULT : 1;
+  tr.dwellTimer = 0.25 * dwellMult;
   const angle = computeInitialTrainAngle(state, line, sIdx, tr.direction);
   tr.x = st.x;
   tr.y = st.y;
   tr.angle = angle;
-  tr.totalTraveled = 0;
-  tr.pathHistory = [];
-  recordTrainHistory(tr, st.x, st.y, angle, 0);
+  updateTrainSpinePoses(state, tr);
   return { ok: true };
+}
+
+export function applyStationUpgrade(state, stationId, upgradeType) {
+  const st = state.stationById.get(stationId);
+  if (!st) return { ok: false, reason: 'Station not found' };
+
+  if (upgradeType === 'interchange') {
+    if (st.isInterchange) return { ok: false, reason: 'Already an Interchange' };
+    if ((state.inventory.interchange ?? 0) <= 0) {
+      return { ok: false, reason: 'No Interchange hubs left' };
+    }
+    state.inventory.interchange -= 1;
+    st.isInterchange = true;
+    st.capacity += CONFIG.INTERCHANGE_CAPACITY_BONUS;
+    st.pulse = 1.0;
+    spawnFloatingToast(
+      state,
+      st.x,
+      st.y - 16,
+      `${st.name} Interchange (+${CONFIG.INTERCHANGE_CAPACITY_BONUS} cap)`,
+      '#2563EB'
+    );
+    return { ok: true };
+  }
+
+  return { ok: false, reason: 'Unknown station upgrade' };
 }
 
 export function applyCorridorUpgrade(state, corridorKey, upgradeType) {
@@ -679,28 +981,6 @@ function isArcPosInHill(corridor, arcS) {
     if (arcS >= iv.start && arcS <= iv.end) return true;
   }
   return false;
-}
-
-function updateTrainPoseOnCorridor(state, train, corridor) {
-  const total = corridor.totalLength;
-  const arcS = train.corridorDir === 'AtoB' ? train.s : total - train.s;
-  const pt = samplePointAlongPolyline(corridor.points, corridor.cumLengths, arcS);
-  const sign = train.corridorDir === 'AtoB' ? 1 : -1;
-  const tx = pt.tx * sign;
-  const ty = pt.ty * sign;
-  const nx = -ty;
-  const ny = tx;
-
-  // Lateral offset for double-track & overtaking
-  let targetLateral = 0;
-  if (corridor.isDoubleTrack) {
-    targetLateral = train.lane === 1 ? -CONFIG.OVERTAKE_OFFSET : 4.5;
-  }
-  train.lateralOffset += (targetLateral - train.lateralOffset) * 0.2;
-
-  train.x = pt.x + nx * train.lateralOffset;
-  train.y = pt.y + ny * train.lateralOffset;
-  train.angle = Math.atan2(ty, tx);
 }
 
 // ---------- Demand, BFS Routing & Station Overflow ----------
@@ -1043,8 +1323,21 @@ function stepDemandAndSpawns(state, simDt, hooks) {
         hooks?.onGameOver?.();
         return;
       }
+      const frac = Math.min(1, st.overflowTimer / CONFIG.OVERFLOW_DURATION);
+      if (st.overflowTimer > CONFIG.OVERFLOW_DURATION * 0.45) {
+        st.warningPulseTimer = (st.warningPulseTimer ?? 0) - simDt;
+        if (st.warningPulseTimer <= 0) {
+          const urgency = (frac - 0.45) / 0.55;
+          st.warningPulseTimer = Math.max(0.45, 1.45 - urgency * 1.0);
+          spawnWarningPulse(state, st.x, st.y, 42 + urgency * 14, '#D94E34');
+          hooks?.onOverflowTick?.(st, frac);
+        }
+      } else {
+        st.warningPulseTimer = 0;
+      }
     } else if (st.overflowTimer > 0) {
       st.overflowTimer = Math.max(0, st.overflowTimer - simDt * CONFIG.OVERFLOW_DRAIN_RATE);
+      st.warningPulseTimer = 0;
     }
   }
 }
@@ -1094,19 +1387,26 @@ function stepTrains(state, simDt, hooks) {
         const st = state.stationById.get(line.stations[tr.stationIndex]);
         if (st) {
           const did = handleStationExchange(state, tr, st, hooks);
-          if (did) tr.dwellTimer = Math.max(tr.dwellTimer, CONFIG.TRAIN_DWELL_TIME);
+          const dwellMult = st.isInterchange ? CONFIG.INTERCHANGE_DWELL_MULT : 1;
+          if (did) tr.dwellTimer = Math.max(tr.dwellTimer, CONFIG.TRAIN_DWELL_TIME * dwellMult);
         }
         tr.exchangedAtStop = true;
       }
       tr.dwellTimer -= simDt;
-      if (tr.dwellTimer > 0) continue;
+      if (tr.dwellTimer > 0) {
+        updateTrainSpinePoses(state, tr);
+        continue;
+      }
       tr.state = 'waitingBlock';
     }
 
     if (tr.state === 'waitingBlock') {
       tr.currentSpeed = 0;
       const next = getNextStop(line, tr.stationIndex, tr.direction);
-      if (!next) continue;
+      if (!next) {
+        updateTrainSpinePoses(state, tr);
+        continue;
+      }
       const fromId = line.stations[tr.stationIndex];
       const toId = line.stations[next.nextIndex];
       const key = edgeKey(fromId, toId);
@@ -1118,6 +1418,7 @@ function stepTrains(state, simDt, hooks) {
 
       const dir = fromId === corridor.aId ? 'AtoB' : 'BtoA';
       if (!canEnterCorridor(corridor, tr, dir)) {
+        updateTrainSpinePoses(state, tr);
         continue;
       }
 
@@ -1231,7 +1532,6 @@ function stepTrains(state, simDt, hooks) {
         nextS = total;
       }
 
-      const stepDist = Math.max(0, nextS - tr.s);
       tr.s = nextS;
 
       if (tr.s >= total) {
@@ -1266,18 +1566,22 @@ function stepTrains(state, simDt, hooks) {
 
         tr.state = 'atStation';
         tr.exchangedAtStop = false;
-        tr.dwellTimer = 0.2;
+        const dwellMult = arrivedStation?.isInterchange ? CONFIG.INTERCHANGE_DWELL_MULT : 1;
+        tr.dwellTimer = 0.2 * dwellMult;
+        updateTrainSpinePoses(state, tr);
         if (arrivedStation) {
-          tr.x = arrivedStation.x;
-          tr.y = arrivedStation.y;
-          recordTrainHistory(tr, tr.x, tr.y, tr.angle, stepDist);
           const did = handleStationExchange(state, tr, arrivedStation, hooks);
-          if (did) tr.dwellTimer = CONFIG.TRAIN_DWELL_TIME;
+          if (did) tr.dwellTimer = CONFIG.TRAIN_DWELL_TIME * dwellMult;
           tr.exchangedAtStop = true;
         }
       } else {
-        updateTrainPoseOnCorridor(state, tr, corridor);
-        recordTrainHistory(tr, tr.x, tr.y, tr.angle, stepDist);
+        const targetLateral = corridor.isDoubleTrack
+          ? tr.lane === 1
+            ? -CONFIG.OVERTAKE_OFFSET
+            : 4.5
+          : 0;
+        tr.lateralOffset += (targetLateral - tr.lateralOffset) * 0.2;
+        updateTrainSpinePoses(state, tr);
 
         tr.exhaustTimer = (tr.exhaustTimer ?? 0) - simDt;
         if (tr.exhaustTimer <= 0) {

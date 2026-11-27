@@ -1,6 +1,15 @@
-import { CONFIG, sampleTrainCarriagePose, screenToWorld, showHint } from './state.js';
+import {
+  CONFIG,
+  panCameraByScreenDelta,
+  sampleTrainCarriagePose,
+  screenToWorld,
+  showHint,
+  zoomCameraAtScreenPoint,
+} from './state.js';
+import { getLineTBarPose } from './mapGen.js';
 import {
   applyCorridorUpgrade,
+  applyStationUpgrade,
   attachCarToTrain,
   deployTrainOnLine,
   extendOrStartLine,
@@ -10,6 +19,7 @@ import {
   reclaimCorridorUpgrade,
   reclaimTrainToInventory,
   removeSegmentFromLine,
+  removeStationFromLine,
 } from './simulation.js';
 
 function syncStationHoverTargets(state) {
@@ -55,6 +65,17 @@ export function hitTestTrain(state, wx, wy, radius = 22) {
   let best = null;
   let bestD = radius;
   for (const tr of state.trains) {
+    if (Array.isArray(tr.unitPoses) && tr.unitPoses.length > 0) {
+      for (const pose of tr.unitPoses) {
+        const d = Math.hypot(pose.x - wx, pose.y - wy);
+        if (d < bestD) {
+          bestD = d;
+          best = tr;
+        }
+      }
+      continue;
+    }
+
     const d = Math.hypot(tr.x - wx, tr.y - wy);
     if (d < bestD) {
       bestD = d;
@@ -76,25 +97,11 @@ export function hitTestTrain(state, wx, wy, radius = 22) {
 export function hitTestTBar(state, wx, wy) {
   for (const line of state.lines) {
     if (line.stations.length < 2 || line.isLoop) continue;
-    const ends = [
-      { stationId: line.stations[0], neighborId: line.stations[1], end: 'start' },
-      {
-        stationId: line.stations[line.stations.length - 1],
-        neighborId: line.stations[line.stations.length - 2],
-        end: 'end',
-      },
-    ];
-    for (const item of ends) {
-      const st = state.stationById.get(item.stationId);
-      const nb = state.stationById.get(item.neighborId);
-      if (!st || !nb) continue;
-      const dx = st.x - nb.x;
-      const dy = st.y - nb.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const tipX = st.x + (dx / len) * CONFIG.T_BAR_OFFSET;
-      const tipY = st.y + (dy / len) * CONFIG.T_BAR_OFFSET;
-      if (Math.hypot(wx - tipX, wy - tipY) <= 18) {
-        return { lineId: line.id, end: item.end, stationId: item.stationId };
+    for (const end of ['start', 'end']) {
+      const pose = getLineTBarPose(state, line, end);
+      if (!pose) continue;
+      if (Math.hypot(wx - pose.x, wy - pose.y) <= 18) {
+        return { lineId: line.id, end, stationId: pose.stationId };
       }
     }
   }
@@ -173,16 +180,58 @@ function applyToolAtWorldPos(state, tool, wx, wy) {
     return { ok: false, reason: 'Drop on a track segment' };
   }
 
+  if (tool === 'interchange') {
+    const st = hitTestStation(state, wx, wy);
+    if (st) return applyStationUpgrade(state, st.id, 'interchange');
+    return { ok: false, reason: 'Drop on a station' };
+  }
+
   return { ok: false };
 }
 
 export function setupInput(canvas, state, callbacks) {
   const dockEl = document.getElementById('bottom-dock');
+  let spaceHeld = false;
+  const activeTouchPointers = new Map();
+  let pinchPrev = null;
 
   const getWorldPosFromClient = (clientX, clientY) => {
     const rect = canvas.getBoundingClientRect();
     return screenToWorld(state, clientX - rect.left, clientY - rect.top);
   };
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') spaceHeld = true;
+  });
+  window.addEventListener('keyup', (e) => {
+    if (e.code === 'Space') spaceHeld = false;
+  });
+  window.addEventListener('blur', () => {
+    spaceHeld = false;
+    activeTouchPointers.clear();
+    pinchPrev = null;
+  });
+
+  // Wheel zoom (cursor-anchored)
+  canvas.addEventListener(
+    'wheel',
+    (e) => {
+      e.preventDefault();
+      if (state.phase === 'gameover') return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const delta = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      const zoomFactor = Math.max(0.75, Math.min(1.35, Math.exp(-delta * 0.0015)));
+      zoomCameraAtScreenPoint(state, sx, sy, zoomFactor);
+    },
+    { passive: false }
+  );
+
+  // Prevent browser middle-click autoscroll
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 1) e.preventDefault();
+  });
 
   // Dock token drag & click-to-select
   document.querySelectorAll('#bottom-dock .dock-token:not(.static-token)').forEach((el) => {
@@ -217,9 +266,33 @@ export function setupInput(canvas, state, callbacks) {
       return;
     }
 
+    // Right-click station to bypass/remove it from active line (or top line passing through)
+    const st = hitTestStation(state, x, y);
+    if (st) {
+      let targetLine = null;
+      const active = state.lines[state.activeLineId];
+      if (active && active.id < state.unlockedLines && active.stations.includes(st.id)) {
+        targetLine = active;
+      } else {
+        for (let i = state.unlockedLines - 1; i >= 0; i--) {
+          if (state.lines[i].stations.includes(st.id)) {
+            targetLine = state.lines[i];
+            break;
+          }
+        }
+      }
+      if (targetLine) {
+        const res = removeStationFromLine(state, targetLine.id, st.id);
+        if (!res.ok && res.reason) {
+          showHint(state, res.reason);
+        }
+        callbacks.onNetworkChanged?.();
+        return;
+      }
+    }
+
     const corridor = hitTestCorridor(state, x, y);
     if (corridor) {
-      // If shift-right-click or midpoint badge, reclaim upgrade first; otherwise remove line segment
       const midPt = corridor.points[Math.floor(corridor.points.length / 2)];
       if (Math.hypot(x - midPt.x, y - midPt.y) < 14 && (corridor.isDoubleTrack || corridor.hasTunnel)) {
         if (corridor.isDoubleTrack) {
@@ -244,7 +317,42 @@ export function setupInput(canvas, state, callbacks) {
   });
 
   canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch') {
+      activeTouchPointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
+      if (activeTouchPointers.size === 2) {
+        const pts = Array.from(activeTouchPointers.values());
+        pinchPrev = {
+          midX: (pts[0].clientX + pts[1].clientX) * 0.5,
+          midY: (pts[0].clientY + pts[1].clientY) * 0.5,
+          dist: Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY),
+        };
+        state.interaction.mode = 'pan';
+        state.interaction.drag = null;
+        return;
+      }
+    }
+
+    // Middle-mouse pan anywhere
+    if (e.button === 1) {
+      e.preventDefault();
+      state.interaction.mode = 'pan';
+      state.interaction.panStart = { clientX: e.clientX, clientY: e.clientY };
+      state.interaction.drag = { lastClientX: e.clientX, lastClientY: e.clientY };
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+
     if (e.button !== 0 || state.phase !== 'playing') return;
+
+    // Space + left-drag pans anywhere
+    if (spaceHeld) {
+      state.interaction.mode = 'pan';
+      state.interaction.panStart = { clientX: e.clientX, clientY: e.clientY };
+      state.interaction.drag = { lastClientX: e.clientX, lastClientY: e.clientY };
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+
     const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
 
     // If a dock tool is selected (click-to-place mode), apply it here
@@ -348,15 +456,51 @@ export function setupInput(canvas, state, callbacks) {
             worldX: x,
             worldY: y,
           };
+          return;
         }
       }
     }
+
+    // 5. Empty paper drag -> Pan camera
+    state.interaction.mode = 'pan';
+    state.interaction.panStart = { clientX: e.clientX, clientY: e.clientY };
+    state.interaction.drag = { lastClientX: e.clientX, lastClientY: e.clientY };
+    canvas.style.cursor = 'grabbing';
   });
 
   window.addEventListener('pointermove', (e) => {
-    const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
+    if (e.pointerType === 'touch' && activeTouchPointers.has(e.pointerId)) {
+      activeTouchPointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
+      if (activeTouchPointers.size === 2 && pinchPrev) {
+        const pts = Array.from(activeTouchPointers.values());
+        const midX = (pts[0].clientX + pts[1].clientX) * 0.5;
+        const midY = (pts[0].clientY + pts[1].clientY) * 0.5;
+        const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY);
+
+        panCameraByScreenDelta(state, midX - pinchPrev.midX, midY - pinchPrev.midY);
+        if (pinchPrev.dist > 10 && dist > 10) {
+          const rect = canvas.getBoundingClientRect();
+          zoomCameraAtScreenPoint(state, midX - rect.left, midY - rect.top, dist / pinchPrev.dist);
+        }
+        pinchPrev = { midX, midY, dist };
+        return;
+      }
+    }
+
     const mode = state.interaction.mode;
     const drag = state.interaction.drag;
+
+    if (mode === 'pan' && drag) {
+      const dx = e.clientX - drag.lastClientX;
+      const dy = e.clientY - drag.lastClientY;
+      drag.lastClientX = e.clientX;
+      drag.lastClientY = e.clientY;
+      panCameraByScreenDelta(state, dx, dy);
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+
+    const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
 
     if (mode === 'buildLine' || mode === 'insertNode') {
       drag.worldX = x;
@@ -392,16 +536,36 @@ export function setupInput(canvas, state, callbacks) {
     state.interaction.hoveredTBar = tbar;
     state.interaction.hoveredCorridorKey = corridor ? corridor.key : null;
 
-    canvas.style.cursor = tr || st || tbar ? 'pointer' : corridor ? 'grab' : 'default';
+    canvas.style.cursor = spaceHeld
+      ? 'grab'
+      : tr || st || tbar
+      ? 'pointer'
+      : corridor
+      ? 'grab'
+      : 'default';
   });
 
-  window.addEventListener('pointerup', (e) => {
+  const endPointer = (e) => {
+    if (e.pointerType === 'touch') {
+      activeTouchPointers.delete(e.pointerId);
+      if (activeTouchPointers.size < 2) {
+        pinchPrev = null;
+      }
+    }
+
     const mode = state.interaction.mode;
     const drag = state.interaction.drag;
-    if (mode === 'idle' || !drag) return;
+    if (mode === 'idle') return;
 
     state.interaction.mode = 'idle';
     state.interaction.drag = null;
+    state.interaction.panStart = null;
+    if (mode === 'pan') {
+      canvas.style.cursor = spaceHeld ? 'grab' : 'default';
+      return;
+    }
+    if (!drag) return;
+
     if (mode === 'buildLine' || mode === 'insertNode') {
       state.interaction.hoveredStationId = null;
       syncStationHoverTargets(state);
@@ -436,14 +600,13 @@ export function setupInput(canvas, state, callbacks) {
       callbacks.onNetworkChanged?.();
     } else if (mode === 'dragToken') {
       if (!drag.moved) {
-        // Toggle click-to-place tool selection
         state.interaction.selectedTool =
           state.interaction.selectedTool === drag.tool ? null : drag.tool;
         callbacks.onNetworkChanged?.();
         return;
       }
       const dockRect = dockEl.getBoundingClientRect();
-      if (e.clientY >= dockRect.top) return; // dropped back on dock
+      if (e.clientY >= dockRect.top) return;
 
       const res = applyToolAtWorldPos(state, drag.tool, x, y);
       if (!res.ok && res.reason) {
@@ -474,5 +637,8 @@ export function setupInput(canvas, state, callbacks) {
         }
       }
     }
-  });
+  };
+
+  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointercancel', endPointer);
 }
