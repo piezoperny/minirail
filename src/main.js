@@ -1,5 +1,5 @@
-import { createInitialState, worldToScreen } from './state.js';
-import { generateWorld } from './mapGen.js';
+import { createInitialState, syncDeviceProfile, worldToScreen } from './state.js';
+import { generateWorld, updateTargetCameraZoom } from './mapGen.js';
 import { initStarterLine, stepSimulation } from './simulation.js';
 import { stepFX } from './fx.js';
 import { renderGame } from './renderer.js';
@@ -36,9 +36,6 @@ try {
 }
 document.documentElement.dataset.theme = state.theme;
 
-generateWorld(state);
-initStarterLine(state);
-
 function resizeCanvas() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const width = window.innerWidth;
@@ -50,10 +47,20 @@ function resizeCanvas() {
   state.viewport.width = width;
   state.viewport.height = height;
   state.viewport.dpr = dpr;
+  syncDeviceProfile(state);
+  if (!state.camera.userControlled && state.stations.length > 0) {
+    updateTargetCameraZoom(state);
+  }
 }
 
-window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
+generateWorld(state);
+initStarterLine(state);
+
+window.addEventListener('resize', resizeCanvas);
+window.addEventListener('orientationchange', () => {
+  setTimeout(resizeCanvas, 80);
+});
 
 const ui = setupUI(state, {
   onRestart(newSeed) {
@@ -64,9 +71,9 @@ const ui = setupUI(state, {
     state.muted = prevMuted;
     state.theme = prevTheme;
     document.documentElement.dataset.theme = state.theme;
+    resizeCanvas();
     generateWorld(state);
     initStarterLine(state);
-    resizeCanvas();
     ui.syncUI();
   },
 });

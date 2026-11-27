@@ -392,6 +392,34 @@ export function setupUI(state, callbacks) {
   }
 
   // Build line pills
+  const clearLineBtn = document.getElementById('btn-clear-line');
+  const topHudEl = document.getElementById('top-hud');
+  const bottomDockEl = document.getElementById('bottom-dock');
+  const scorePillEl = document.querySelector('.score-pill');
+
+  if (scorePillEl) {
+    scorePillEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      scorePillEl.classList.toggle('is-open');
+    });
+    window.addEventListener('pointerdown', (e) => {
+      if (!scorePillEl.contains(e.target)) {
+        scorePillEl.classList.remove('is-open');
+      }
+    });
+  }
+
+  clearLineBtn?.addEventListener('click', () => {
+    const lineId = state.activeLineId;
+    if (lineId >= state.unlockedLines || state.lines[lineId].stations.length === 0) return;
+    clearLine(state, lineId);
+    if (state.interaction.spotlightLineId === lineId) {
+      state.interaction.spotlightLineId = null;
+    }
+    showHint(state, `${CONFIG.LINE_NAMES[lineId]} Line cleared`);
+    syncUI();
+  });
+
   const linePills = [];
   dockLines.innerHTML = '';
   for (let i = 0; i < CONFIG.MAX_LINES; i++) {
@@ -401,7 +429,43 @@ export function setupUI(state, callbacks) {
     pill.style.backgroundColor = getLineColor(state, i);
     pill.title = `${CONFIG.LINE_NAMES[i]} Line (Right-click to clear)`;
     pill.dataset.lineId = String(i);
+    let pillHoldTimer = null;
+    let pillLongPressed = false;
+    pill.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'touch' || i >= state.unlockedLines || state.lines[i].stations.length === 0) {
+        return;
+      }
+      pillLongPressed = false;
+      pillHoldTimer = setTimeout(() => {
+        pillHoldTimer = null;
+        pillLongPressed = true;
+        clearLine(state, i);
+        if (state.interaction.spotlightLineId === i) {
+          state.interaction.spotlightLineId = null;
+        }
+        showHint(state, `${CONFIG.LINE_NAMES[i]} Line cleared`);
+        syncUI();
+      }, 480);
+    });
+    const cancelPillHold = () => {
+      if (pillHoldTimer) {
+        clearTimeout(pillHoldTimer);
+        pillHoldTimer = null;
+      }
+    };
+    pill.addEventListener('pointerup', cancelPillHold);
+    pill.addEventListener('pointercancel', cancelPillHold);
+    pill.addEventListener('pointerleave', () => {
+      cancelPillHold();
+      if (state.interaction.spotlightLineId === i) {
+        state.interaction.spotlightLineId = null;
+      }
+    });
     pill.addEventListener('click', () => {
+      if (pillLongPressed) {
+        pillLongPressed = false;
+        return;
+      }
       if (i >= state.unlockedLines) return;
       state.activeLineId = i;
       syncUI();
@@ -409,11 +473,6 @@ export function setupUI(state, callbacks) {
     pill.addEventListener('pointerenter', () => {
       if (i < state.unlockedLines && state.lines[i].stations.length >= 2) {
         state.interaction.spotlightLineId = i;
-      }
-    });
-    pill.addEventListener('pointerleave', () => {
-      if (state.interaction.spotlightLineId === i) {
-        state.interaction.spotlightLineId = null;
       }
     });
     pill.addEventListener('contextmenu', (e) => {
@@ -557,10 +616,13 @@ export function setupUI(state, callbacks) {
 
         const dx = scr.x - cx;
         const dy = scr.y - cy;
+        const topPad = topHudEl ? Math.max(68, topHudEl.getBoundingClientRect().bottom + 14) : 68;
+        const dockTop = bottomDockEl ? bottomDockEl.getBoundingClientRect().top : h - 72;
+        const botPad = Math.max(86, h - dockTop + 14);
         const minX = 48;
         const maxX = Math.max(minX + 1, w - 48);
-        const minY = 68;
-        const maxY = Math.max(minY + 1, h - 86);
+        const minY = topPad;
+        const maxY = Math.max(minY + 1, h - botPad);
 
         let t = 1;
         if (dx > 0) t = Math.min(t, (maxX - cx) / dx);
@@ -634,6 +696,16 @@ export function setupUI(state, callbacks) {
       pill.classList.toggle('in-use', inUse);
       pill.classList.toggle('active', i === state.activeLineId);
     });
+
+    if (clearLineBtn) {
+      const activeLine = state.lines[state.activeLineId];
+      const canClear = Boolean(
+        (state.device?.isMobile || state.device?.isTouch) &&
+          activeLine &&
+          activeLine.stations.length >= 2
+      );
+      clearLineBtn.classList.toggle('is-hidden', !canClear);
+    }
 
     for (const [key, el] of Object.entries(countEls)) {
       if (!el) continue;

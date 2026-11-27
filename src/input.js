@@ -96,13 +96,13 @@ export function hitTestTrain(state, wx, wy, radius = 22) {
   return best;
 }
 
-export function hitTestTBar(state, wx, wy) {
+export function hitTestTBar(state, wx, wy, radius = 18) {
   for (const line of state.lines) {
     if (line.stations.length < 2 || line.isLoop) continue;
     for (const end of ['start', 'end']) {
       const pose = getLineTBarPose(state, line, end);
       if (!pose) continue;
-      if (Math.hypot(wx - pose.x, wy - pose.y) <= 18) {
+      if (Math.hypot(wx - pose.x, wy - pose.y) <= radius) {
         return { lineId: line.id, end, stationId: pose.stationId };
       }
     }
@@ -219,6 +219,65 @@ export function setupInput(canvas, state, callbacks) {
   let spaceHeld = false;
   const activeTouchPointers = new Map();
   let pinchPrev = null;
+  let longPressTimer = null;
+  let longPressStart = null;
+  let longPressAnim = null;
+
+  const isTouchInteraction = (e) => e?.pointerType === 'touch' || Boolean(state.device?.isTouch);
+  const hitRadii = (e) => {
+    const touch = isTouchInteraction(e);
+    return {
+      station: touch ? 36 : 26,
+      tbar: touch ? 28 : 18,
+      train: touch ? 32 : 22,
+      corridor: touch ? 26 : 16,
+      snap: touch ? 34 : 25,
+    };
+  };
+
+  const cancelLongPress = () => {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+    if (longPressAnim) {
+      cancelAnimationFrame(longPressAnim);
+      longPressAnim = null;
+    }
+    longPressStart = null;
+    state.interaction.longPressVisual = null;
+  };
+
+  const startLongPress = (clientX, clientY, worldX, worldY, onTrigger) => {
+    cancelLongPress();
+    const duration = 460;
+    const startedAt = performance.now();
+    longPressStart = { clientX, clientY };
+    state.interaction.longPressVisual = { x: worldX, y: worldY, progress: 0 };
+
+    const tickVisual = () => {
+      if (!longPressTimer) return;
+      const elapsed = performance.now() - startedAt;
+      if (state.interaction.longPressVisual) {
+        state.interaction.longPressVisual.progress = Math.min(1, elapsed / duration);
+      }
+      if (elapsed < duration) {
+        longPressAnim = requestAnimationFrame(tickVisual);
+      }
+    };
+    longPressAnim = requestAnimationFrame(tickVisual);
+
+    longPressTimer = setTimeout(() => {
+      longPressTimer = null;
+      if (longPressAnim) {
+        cancelAnimationFrame(longPressAnim);
+        longPressAnim = null;
+      }
+      longPressStart = null;
+      state.interaction.longPressVisual = null;
+      onTrigger();
+    }, duration);
+  };
 
   const getWorldPosFromClient = (clientX, clientY) => {
     const rect = canvas.getBoundingClientRect();
@@ -235,6 +294,7 @@ export function setupInput(canvas, state, callbacks) {
     spaceHeld = false;
     activeTouchPointers.clear();
     pinchPrev = null;
+    cancelLongPress();
   });
 
   // Wheel zoom (cursor-anchored)
@@ -345,6 +405,7 @@ export function setupInput(canvas, state, callbacks) {
     if (e.pointerType === 'touch') {
       activeTouchPointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
       if (activeTouchPointers.size === 2) {
+        cancelLongPress();
         const pts = Array.from(activeTouchPointers.values());
         pinchPrev = {
           midX: (pts[0].clientX + pts[1].clientX) * 0.5,
@@ -353,6 +414,8 @@ export function setupInput(canvas, state, callbacks) {
         };
         state.interaction.mode = 'pan';
         state.interaction.drag = null;
+        state.interaction.hoveredStationId = null;
+        syncStationHoverTargets(state);
         return;
       }
     }
@@ -379,6 +442,7 @@ export function setupInput(canvas, state, callbacks) {
     }
 
     const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
+    const radii = hitRadii(e);
 
     // If a dock tool is selected (click-to-place mode), apply it here
     if (state.interaction.selectedTool) {
@@ -398,8 +462,8 @@ export function setupInput(canvas, state, callbacks) {
       state.interaction.selectedTool = null;
     }
 
-    // 1. Check train drag for redeployment
-    const tr = hitTestTrain(state, x, y);
+    // 1. Check train drag for redeployment (or long-press on touch to reclaim)
+    const tr = hitTestTrain(state, x, y, radii.train);
     if (tr) {
       state.interaction.mode = 'dragTrain';
       state.interaction.drag = {
@@ -408,11 +472,22 @@ export function setupInput(canvas, state, callbacks) {
         worldX: x,
         worldY: y,
       };
+      if (isTouchInteraction(e)) {
+        startLongPress(e.clientX, e.clientY, x, y, () => {
+          if (state.interaction.mode === 'dragTrain') {
+            state.interaction.mode = 'idle';
+            state.interaction.drag = null;
+            reclaimTrainToInventory(state, tr.id);
+            showHint(state, 'Train returned to dock', 1.6);
+            callbacks.onNetworkChanged?.();
+          }
+        });
+      }
       return;
     }
 
     // 2. Check T-bar extension/pullback
-    const tbar = hitTestTBar(state, x, y);
+    const tbar = hitTestTBar(state, x, y, radii.tbar);
     if (tbar) {
       state.activeLineId = tbar.lineId;
       state.interaction.mode = 'buildLine';
@@ -429,7 +504,7 @@ export function setupInput(canvas, state, callbacks) {
     }
 
     // 3. Check station drag: detach interior station OR start/extend line
-    const st = hitTestStation(state, x, y);
+    const st = hitTestStation(state, x, y, radii.station);
     if (st) {
       const activeLine = state.lines[state.activeLineId];
       const activeIsEmpty = activeLine && activeLine.id < state.unlockedLines && activeLine.stations.length === 0;
@@ -498,8 +573,8 @@ export function setupInput(canvas, state, callbacks) {
       return;
     }
 
-    // 4. Check corridor drag to insert a station mid-segment
-    const corridor = hitTestCorridor(state, x, y);
+    // 4. Check corridor drag to insert a station mid-segment (or long-press on touch to remove)
+    const corridor = hitTestCorridor(state, x, y, radii.corridor);
     if (corridor) {
       if (e.shiftKey && (corridor.isDoubleTrack || corridor.hasTunnel)) {
         if (corridor.isDoubleTrack) reclaimCorridorUpgrade(state, corridor.key, 'doubleTrack');
@@ -531,6 +606,30 @@ export function setupInput(canvas, state, callbacks) {
             worldX: x,
             worldY: y,
           };
+          if (isTouchInteraction(e)) {
+            startLongPress(e.clientX, e.clientY, x, y, () => {
+              if (state.interaction.mode === 'insertNode') {
+                state.interaction.mode = 'idle';
+                state.interaction.drag = null;
+                const midPt = corridor.points[Math.floor(corridor.points.length / 2)];
+                if (
+                  Math.hypot(x - midPt.x, y - midPt.y) < 20 &&
+                  (corridor.isDoubleTrack || corridor.hasTunnel)
+                ) {
+                  if (corridor.isDoubleTrack) {
+                    const res = reclaimCorridorUpgrade(state, corridor.key, 'doubleTrack');
+                    if (!res.ok && res.reason) showHint(state, res.reason);
+                  } else if (corridor.hasTunnel) {
+                    reclaimCorridorUpgrade(state, corridor.key, 'tunnel');
+                  }
+                } else {
+                  removeSegmentFromLine(state, lineId, corridor.aId, corridor.bId);
+                  showHint(state, 'Track segment removed', 1.6);
+                }
+                callbacks.onNetworkChanged?.();
+              }
+            });
+          }
           return;
         }
       }
@@ -544,6 +643,11 @@ export function setupInput(canvas, state, callbacks) {
   });
 
   window.addEventListener('pointermove', (e) => {
+    if (longPressStart) {
+      const movePx = Math.hypot(e.clientX - longPressStart.clientX, e.clientY - longPressStart.clientY);
+      if (movePx > 10) cancelLongPress();
+    }
+
     if (e.pointerType === 'touch' && activeTouchPointers.has(e.pointerId)) {
       activeTouchPointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
       if (activeTouchPointers.size === 2 && pinchPrev) {
@@ -564,6 +668,7 @@ export function setupInput(canvas, state, callbacks) {
 
     const mode = state.interaction.mode;
     const drag = state.interaction.drag;
+    const radii = hitRadii(e);
 
     if (mode === 'pan' && drag) {
       const dx = e.clientX - drag.lastClientX;
@@ -622,7 +727,7 @@ export function setupInput(canvas, state, callbacks) {
       }
 
       // 2. Continuous One-Stroke Sweep
-      const snap = hitTestStation(state, x, y, 25);
+      const snap = hitTestStation(state, x, y, radii.snap);
       if (snap && snap.id !== drag.fromStationId) {
         const isUnwind =
           line &&
@@ -677,7 +782,7 @@ export function setupInput(canvas, state, callbacks) {
     if (mode === 'insertNode') {
       drag.worldX = x;
       drag.worldY = y;
-      const snap = hitTestStation(state, x, y, 30);
+      const snap = hitTestStation(state, x, y, radii.snap);
       drag.snapStationId = snap && snap.id !== drag.fromStationId ? snap.id : null;
       state.interaction.hoveredStationId = drag.snapStationId;
       syncStationHoverTargets(state);
@@ -690,7 +795,7 @@ export function setupInput(canvas, state, callbacks) {
       drag.worldY = y;
       const st = state.stationById.get(drag.stationId);
       drag.detached = st ? Math.hypot(x - st.x, y - st.y) >= 28 : false;
-      const snap = drag.detached ? hitTestStation(state, x, y, 25) : null;
+      const snap = drag.detached ? hitTestStation(state, x, y, radii.snap) : null;
       drag.snapStationId = snap && snap.id !== drag.stationId ? snap.id : null;
       state.interaction.hoveredStationId = drag.snapStationId;
       syncStationHoverTargets(state);
@@ -710,10 +815,10 @@ export function setupInput(canvas, state, callbacks) {
     }
 
     // Idle hover
-    const tr = hitTestTrain(state, x, y);
-    const st = tr ? null : hitTestStation(state, x, y);
-    const tbar = tr || st ? null : hitTestTBar(state, x, y);
-    const corridor = tr || st || tbar ? null : hitTestCorridor(state, x, y);
+    const tr = hitTestTrain(state, x, y, radii.train);
+    const st = tr ? null : hitTestStation(state, x, y, radii.station);
+    const tbar = tr || st ? null : hitTestTBar(state, x, y, radii.tbar);
+    const corridor = tr || st || tbar ? null : hitTestCorridor(state, x, y, radii.corridor);
 
     state.interaction.hoveredTrainId = tr ? tr.id : null;
     state.interaction.hoveredStationId = st ? st.id : null;
@@ -731,6 +836,8 @@ export function setupInput(canvas, state, callbacks) {
   });
 
   const endPointer = (e) => {
+    cancelLongPress();
+
     if (e.pointerType === 'touch') {
       activeTouchPointers.delete(e.pointerId);
       if (activeTouchPointers.size < 2) {
@@ -758,6 +865,7 @@ export function setupInput(canvas, state, callbacks) {
 
     if (state.phase !== 'playing') return;
     const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
+    const radii = hitRadii(e);
 
     if (mode === 'buildLine') {
       if (drag.snapStationId) {
@@ -812,8 +920,19 @@ export function setupInput(canvas, state, callbacks) {
       callbacks.onNetworkChanged?.();
     } else if (mode === 'dragToken') {
       if (!drag.moved) {
-        state.interaction.selectedTool =
-          state.interaction.selectedTool === drag.tool ? null : drag.tool;
+        const nextTool = state.interaction.selectedTool === drag.tool ? null : drag.tool;
+        state.interaction.selectedTool = nextTool;
+        if (nextTool && isTouchInteraction(e)) {
+          const toolHints = {
+            express: 'Tap a rail line to deploy Passenger',
+            freight: 'Tap a rail line to deploy Freight',
+            car: 'Tap a train to add +Carriage',
+            doubleTrack: 'Tap a track segment for Double-Track',
+            tunnel: 'Tap a hill segment to bore a Tunnel',
+            interchange: 'Tap a station to build Interchange',
+          };
+          if (toolHints[nextTool]) showHint(state, toolHints[nextTool], 2.2);
+        }
         callbacks.onNetworkChanged?.();
         return;
       }
@@ -832,7 +951,7 @@ export function setupInput(canvas, state, callbacks) {
         callbacks.onNetworkChanged?.();
         return;
       }
-      const corridor = hitTestCorridor(state, x, y);
+      const corridor = hitTestCorridor(state, x, y, radii.corridor);
       if (corridor) {
         const ids = Array.from(corridor.activeLineIds);
         const lineId = ids.includes(state.activeLineId) ? state.activeLineId : ids[0];
@@ -840,7 +959,7 @@ export function setupInput(canvas, state, callbacks) {
         callbacks.onNetworkChanged?.();
         return;
       }
-      const st = hitTestStation(state, x, y);
+      const st = hitTestStation(state, x, y, radii.station);
       if (st) {
         const line = state.lines.find((l) => l.stations.includes(st.id) && l.stations.length >= 2);
         if (line) {

@@ -1244,6 +1244,24 @@ export function updateTargetCameraZoom(state) {
     maxAbsX = Math.max(maxAbsX, Math.abs(st.x) + 140);
     maxAbsY = Math.max(maxAbsY, Math.abs(st.y) + 120);
   }
+  if (state.device?.isMobile) {
+    const baseFit = Math.max(
+      0.45,
+      Math.min(
+        state.viewport.width / CONFIG.BASE_VIEW_WIDTH,
+        state.viewport.height / CONFIG.BASE_VIEW_HEIGHT
+      )
+    );
+    const availW = Math.max(220, state.viewport.width - 36);
+    const availH = Math.max(240, state.viewport.height - (state.device.isPortrait ? 210 : 145));
+    const zoomX = availW / (maxAbsX * 2 * baseFit);
+    const zoomY = availH / (maxAbsY * 2 * baseFit);
+    state.camera.targetX = 0;
+    state.camera.targetY = state.device.isPortrait ? 24 : 12;
+    state.camera.targetZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(1.15, zoomX, zoomY));
+    return;
+  }
+
   const zoomX = (CONFIG.BASE_VIEW_WIDTH * 0.46) / maxAbsX;
   const zoomY = (CONFIG.BASE_VIEW_HEIGHT * 0.44) / maxAbsY;
   state.camera.targetX = 0;

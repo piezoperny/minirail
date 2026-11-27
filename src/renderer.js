@@ -1527,6 +1527,31 @@ export function renderGame(ctx, state) {
   drawFX(ctx, state, pal);
   drawDragPreview(ctx, state, pal);
 
+  // Touch long-press reclaim progress ring
+  if (state.interaction.longPressVisual && state.interaction.longPressVisual.progress > 0.08) {
+    const lp = state.interaction.longPressVisual;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(lp.x, lp.y, 24, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(217, 78, 52, 0.25)';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(
+      lp.x,
+      lp.y,
+      24,
+      -Math.PI / 2,
+      -Math.PI / 2 + Math.PI * 2 * Math.min(1, lp.progress)
+    );
+    ctx.strokeStyle = pal.danger;
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // Flash message in world space
   if (state.interaction.flashMessage) {
     const fm = state.interaction.flashMessage;

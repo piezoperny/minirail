@@ -2,7 +2,10 @@
 <html lang="en" data-theme="day">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#232629">
   <meta name="description" content="Mini Rail — Minimalist transit network builder. Connect hamlets, towns, factories, and cities with Passenger bullet trains and heavy Freight hoppers.">
   <meta property="og:type" content="website">
@@ -88,8 +91,12 @@
 
     <!-- Bottom Inventory Dock -->
     <footer id="bottom-dock" class="hud-panel">
-      <div class="dock-section" id="dock-lines" aria-label="Rail Lines"></div>
+      <div class="dock-lines-wrap">
+        <div class="dock-section" id="dock-lines" aria-label="Rail Lines"></div>
+        <button id="btn-clear-line" class="clear-line-btn is-hidden" type="button" title="Clear active line (or right-click / long-press line pill)" aria-label="Clear Active Line">✕</button>
+      </div>
       <div class="dock-divider"></div>
+      <div class="dock-tools-wrap">
       <div class="dock-section" id="dock-fleet" aria-label="Locomotives and Carriages">
         <div class="dock-token" data-tool="express" draggable="false" title="Passenger Train (Bullet locomotive + 2 coaches for commuters &amp; intercity riders)">
           <span class="token-icon token-express">
@@ -176,6 +183,7 @@
           <span class="token-badge" id="count-interchange">0</span>
         </div>
       </div>
+      </div>
     </footer>
 
     <!-- 2-Tap Mini Metro Weekly Reward Overlay -->
@@ -225,10 +233,10 @@
         <div class="modal-eyebrow">FIELD MANUAL</div>
         <h2 id="help-title">Mini Rail Controls &amp; Supply Chain</h2>
         <ul class="help-list">
-          <li><strong>One-Stroke &amp; Pull-Out Lines:</strong> Drag across stations in one continuous stroke to connect them. Pull a line&rsquo;s T-bar end backward to shorten it, or pull an interior station outward to bypass or reroute it. Right-click a line pill to clear a route.</li>
+          <li><strong>One-Stroke &amp; Pull-Out Lines:</strong> Drag across stations in one continuous stroke to connect them. Pull a line&rsquo;s T-bar end backward to shorten it, or pull an interior station outward to bypass or reroute it. Right-click or long-press a line pill (or tap <strong>&times;</strong>) to clear a route.</li>
           <li><strong>Passenger vs. Freight:</strong> <strong>Passenger</strong> bullet trains carry Commuters (Towns &harr; Cities) and color-coded Intercity Tickets. <strong>Freight</strong> dark-framed hoppers haul Raw Materials (Forest/Mine &rarr; Factory) and Goods (Factory &rarr; Hamlet/Town) to grow Cities.</li>
-          <li><strong>Rivers, Mountains &amp; Hills:</strong> Bridges auto-span rivers/lakes and <strong>Tunnels</strong> auto-bore through <strong>Mountains</strong> (reclaimed when tracks are removed). Drag <strong>Tunnel</strong> onto rolling hills for full speed, <strong>Double-Track</strong> for passing, <strong>+Carriage</strong> onto trains, or <strong>Interchange</strong> onto hubs.</li>
-          <li><strong>Camera &amp; Shortcuts:</strong> Scroll or pinch to zoom (<code>0.45&times;&ndash;2.5&times;</code>). Drag empty paper, middle-drag, or Space+drag to pan. Press <strong>F</strong>/<strong>0</strong> to fit map, <strong>N</strong> for Night Mode, <strong>M</strong> to mute, <strong>Space</strong> to pause.</li>
+          <li><strong>Rivers, Mountains &amp; Hills:</strong> Bridges auto-span rivers/lakes and <strong>Tunnels</strong> auto-bore through <strong>Mountains</strong> (reclaimed when tracks are removed). Drag or tap-to-place <strong>Tunnel</strong>, <strong>Double-Track</strong>, <strong>+Carriage</strong>, or <strong>Interchange</strong>. Long-press a train or track on touch devices to reclaim/remove.</li>
+          <li><strong>Camera &amp; Shortcuts:</strong> Scroll or two-finger pinch to zoom (<code>0.45&times;&ndash;2.5&times;</code>). Drag empty paper or two-finger drag to pan. Press <strong>F</strong>/<strong>0</strong> to fit map, <strong>N</strong> for Night Mode, <strong>M</strong> to mute, <strong>Space</strong> to pause.</li>
         </ul>
         <div class="help-seed-row">
           <span>Map Seed: <strong id="help-seed">-</strong></span>

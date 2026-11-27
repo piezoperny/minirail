@@ -228,6 +228,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
 
     // Camera & Viewport
     viewport: { width: 1280, height: 780, dpr: 1 },
+    device: { isMobile: false, isTouch: false, isPortrait: false, layout: 'desktop' },
     camera: {
       x: 0,
       y: 0,
@@ -298,6 +299,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
       hintText: '',
       hintTimer: 0,
       flashMessage: null, // { text, x, y, timer }
+      longPressVisual: null, // { x, y, progress }
     },
   };
 }
@@ -397,12 +399,89 @@ export function resetCameraToFit(state) {
   const cy = (minY + maxY) * 0.5;
   const halfW = Math.max(430, (maxX - minX) * 0.5 + 140);
   const halfH = Math.max(260, (maxY - minY) * 0.5 + 120);
+
+  if (state.device?.isMobile) {
+    const baseFit = Math.max(
+      0.45,
+      Math.min(
+        state.viewport.width / CONFIG.BASE_VIEW_WIDTH,
+        state.viewport.height / CONFIG.BASE_VIEW_HEIGHT
+      )
+    );
+    const availW = Math.max(220, state.viewport.width - 36);
+    const availH = Math.max(240, state.viewport.height - (state.device.isPortrait ? 210 : 145));
+    const zoomX = availW / (halfW * 2 * baseFit);
+    const zoomY = availH / (halfH * 2 * baseFit);
+    state.camera.targetX = cx;
+    state.camera.targetY = cy + (state.device.isPortrait ? 24 : 12);
+    state.camera.targetZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(1.15, zoomX, zoomY));
+    return;
+  }
+
   const zoomX = (CONFIG.BASE_VIEW_WIDTH * 0.46) / halfW;
   const zoomY = (CONFIG.BASE_VIEW_HEIGHT * 0.44) / halfH;
 
   state.camera.targetX = cx;
   state.camera.targetY = cy;
   state.camera.targetZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(1.0, zoomX, zoomY));
+}
+
+export function detectDeviceProfile() {
+  if (typeof window === 'undefined') {
+    return { isMobile: false, isTouch: false, isPortrait: false, layout: 'desktop' };
+  }
+  const width = window.innerWidth || 1280;
+  const height = window.innerHeight || 780;
+  const isPortrait = height > width;
+
+  const hasCoarsePointer = Boolean(window.matchMedia?.('(pointer: coarse)')?.matches);
+  const hasAnyHover = Boolean(window.matchMedia?.('(hover: hover)')?.matches);
+  const hasTouch =
+    'ontouchstart' in window || (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0);
+  const uaMobile =
+    typeof navigator !== 'undefined' &&
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent || '');
+
+  let forced = null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mobile') === '1') forced = 'mobile';
+    else if (params.get('desktop') === '1') forced = 'desktop';
+  } catch {
+    // ignore URL parsing errors
+  }
+
+  let isMobile;
+  if (forced === 'mobile') {
+    isMobile = true;
+  } else if (forced === 'desktop') {
+    isMobile = false;
+  } else {
+    isMobile =
+      width <= 860 ||
+      Math.min(width, height) <= 640 ||
+      (hasCoarsePointer && !hasAnyHover) ||
+      (uaMobile && width <= 1024);
+  }
+
+  const isTouch = Boolean(hasTouch || hasCoarsePointer || forced === 'mobile');
+  return {
+    isMobile,
+    isTouch,
+    isPortrait,
+    layout: isMobile ? 'mobile' : 'desktop',
+  };
+}
+
+export function syncDeviceProfile(state) {
+  const profile = detectDeviceProfile();
+  state.device = profile;
+  if (typeof document !== 'undefined' && document.documentElement) {
+    document.documentElement.dataset.device = profile.layout;
+    document.documentElement.dataset.touch = profile.isTouch ? 'true' : 'false';
+    document.documentElement.dataset.orientation = profile.isPortrait ? 'portrait' : 'landscape';
+  }
+  return profile;
 }
 
 export function showHint(state, text, duration = 2.2) {
