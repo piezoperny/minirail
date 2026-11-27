@@ -4,14 +4,36 @@ import {
   buildLineSpine,
   buildOctilinearPoints,
   computeHillIntervals,
+  computeMountainIntervals,
   computePolylineLengths,
   computeRiverIntervals,
   computeStationQueueAngle,
   computeTrainUnitPoses,
+  countMountainCrossings,
   countRiverCrossings,
+  projectPointOntoSpine,
   samplePointAlongPolyline,
   spawnNextStation,
 } from './mapGen.js';
+
+function getWater(state) {
+  if (Array.isArray(state?.rivers) && state.rivers.length > 0) {
+    return { rivers: state.rivers, lakes: state.lakes || [] };
+  }
+  if (Array.isArray(state?.lakes) && state.lakes.length > 0) {
+    return {
+      rivers: state.river?.points?.length ? [state.river] : [],
+      lakes: state.lakes,
+    };
+  }
+  return state?.river || { rivers: [], lakes: [] };
+}
+
+export function getConsistLength(train) {
+  const cars = train?.cars ?? CONFIG.TRAIN_DEFAULT_CARS;
+  const unitLen = train?.type === 'freight' ? CONFIG.FREIGHT_UNIT_LEN : CONFIG.PASSENGER_UNIT_LEN;
+  return cars * CONFIG.CAR_SPACING + unitLen;
+}
 
 function markLineSpineDirty(line) {
   if (line) line.spine = null;
@@ -57,6 +79,7 @@ function collectUsedAnglesAtStation(state, stationId) {
 function buildCorridorContext(state, aId, bId) {
   return {
     stations: state.stations || [],
+    mountains: state.mountains || [],
     usedAnglesAtA: collectUsedAnglesAtStation(state, aId),
     usedAnglesAtB: collectUsedAnglesAtStation(state, bId),
   };
@@ -110,11 +133,14 @@ export function getOrCreateCorridor(state, id1, id2) {
   }
   const stA = state.stationById.get(aId);
   const stB = state.stationById.get(bId);
+  const water = getWater(state);
   const context = buildCorridorContext(state, aId, bId);
-  const points = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, state.river, state.hills, context);
+  const points = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, water, state.hills, context);
   const { cumLengths, totalLength } = computePolylineLengths(points);
-  const riverCrossings = countRiverCrossings(points, state.river);
-  const riverIntervals = computeRiverIntervals(points, cumLengths, totalLength, state.river);
+  const riverCrossings = countRiverCrossings(points, water);
+  const riverIntervals = computeRiverIntervals(points, cumLengths, totalLength, water);
+  const mountainCrossings = countMountainCrossings(points, state.mountains);
+  const mountainIntervals = computeMountainIntervals(points, cumLengths, totalLength, state.mountains);
   const hillIntervals = computeHillIntervals(points, cumLengths, totalLength, state.hills);
 
   const corridor = {
@@ -127,6 +153,9 @@ export function getOrCreateCorridor(state, id1, id2) {
     riverCrossings,
     riverIntervals,
     hasBridge: false,
+    mountainCrossings,
+    mountainIntervals,
+    hasMountainTunnel: false,
     hillIntervals,
     hasTunnel: false,
     isDoubleTrack: false,
@@ -172,27 +201,53 @@ export function canAddCorridorForLine(state, id1, id2) {
     if (existing.riverCrossings > 0 && !existing.hasBridge && state.inventory.bridge <= 0) {
       return { ok: false, reason: 'No Bridges left!' };
     }
+    if (
+      existing.mountainCrossings > 0 &&
+      !existing.hasMountainTunnel &&
+      !existing.hasTunnel &&
+      state.inventory.tunnel <= 0
+    ) {
+      return { ok: false, reason: 'No Tunnels left!' };
+    }
     return { ok: true };
   }
   const [aId, bId] = orderedPair(id1, id2);
   const stA = state.stationById.get(aId);
   const stB = state.stationById.get(bId);
   if (!stA || !stB) return { ok: false, reason: 'Station not found' };
+  const water = getWater(state);
   const context = buildCorridorContext(state, aId, bId);
-  const pts = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, state.river, state.hills, context);
-  const crossings = countRiverCrossings(pts, state.river);
+  const pts = buildOctilinearPoints(stA.x, stA.y, stB.x, stB.y, water, state.hills, context);
+  const crossings = countRiverCrossings(pts, water);
   if (crossings > 0 && state.inventory.bridge <= 0) {
     return { ok: false, reason: 'No Bridges left!' };
+  }
+  const mCrossings = countMountainCrossings(pts, state.mountains);
+  if (mCrossings > 0 && state.inventory.tunnel <= 0) {
+    return { ok: false, reason: 'No Tunnels left!' };
   }
   return { ok: true };
 }
 
 function activateCorridorForLine(state, line, id1, id2) {
   const corridor = getOrCreateCorridor(state, id1, id2);
-  if (corridor.riverCrossings > 0 && !corridor.hasBridge) {
-    if (state.inventory.bridge <= 0) return false;
+  const needsBridge = corridor.riverCrossings > 0 && !corridor.hasBridge;
+  const needsMountainTunnel =
+    corridor.mountainCrossings > 0 && !corridor.hasMountainTunnel && !corridor.hasTunnel;
+
+  if (needsBridge && state.inventory.bridge <= 0) return false;
+  if (needsMountainTunnel && state.inventory.tunnel <= 0) return false;
+
+  if (needsBridge) {
     state.inventory.bridge -= 1;
     corridor.hasBridge = true;
+  }
+  if (needsMountainTunnel) {
+    state.inventory.tunnel -= 1;
+    corridor.hasMountainTunnel = true;
+    corridor.hasTunnel = true;
+  } else if (corridor.mountainCrossings > 0 && corridor.hasTunnel) {
+    corridor.hasMountainTunnel = true;
   }
   corridor.activeLineIds.add(line.id);
   line.removingEdges.delete(corridor.key);
@@ -207,9 +262,10 @@ function releaseCorridorIfUnused(state, corridor) {
       state.inventory.bridge += 1;
       corridor.hasBridge = false;
     }
-    if (corridor.hasTunnel) {
+    if (corridor.hasTunnel || corridor.hasMountainTunnel) {
       state.inventory.tunnel += 1;
       corridor.hasTunnel = false;
+      corridor.hasMountainTunnel = false;
     }
     if (corridor.isDoubleTrack) {
       state.inventory.doubleTrack += 1;
@@ -273,7 +329,7 @@ export function extendOrStartLine(state, lineId, fromId, toId) {
           state,
           (fromSt.x + toSt.x) * 0.5,
           (fromSt.y + toSt.y) * 0.5 - 10,
-          preferred === 'freight' ? 'Freight Dispatched!' : 'Express Dispatched!',
+          preferred === 'freight' ? 'Freight Dispatched!' : 'Passenger Dispatched!',
           line.color
         );
       }
@@ -515,6 +571,60 @@ export function removeStationFromLine(state, lineId, stationId) {
   return { ok: true };
 }
 
+export function replaceStationInLine(state, lineId, oldStationId, newStationId) {
+  const line = state.lines[lineId];
+  if (!line) return { ok: false, reason: 'Line not found' };
+  if (oldStationId === newStationId) return { ok: false, reason: 'Same station' };
+  const idx = line.stations.indexOf(oldStationId);
+  if (idx === -1) return { ok: false, reason: 'Station not on line' };
+  if (line.stations.includes(newStationId)) {
+    return { ok: false, reason: 'Station already on this line' };
+  }
+  const newSt = state.stationById.get(newStationId);
+  if (!newSt) return { ok: false, reason: 'Station not found' };
+
+  const n = line.stations.length;
+  const prevId = line.isLoop
+    ? line.stations[(idx - 1 + n) % n]
+    : idx > 0
+      ? line.stations[idx - 1]
+      : null;
+  const nextId = line.isLoop
+    ? line.stations[(idx + 1) % n]
+    : idx < n - 1
+      ? line.stations[idx + 1]
+      : null;
+
+  if (prevId !== null) {
+    const checkPrev = canAddCorridorForLine(state, prevId, newStationId);
+    if (!checkPrev.ok) return checkPrev;
+  }
+  if (nextId !== null) {
+    const checkNext = canAddCorridorForLine(state, newStationId, nextId);
+    if (!checkNext.ok) return checkNext;
+  }
+
+  line.stations[idx] = newStationId;
+  markLineSpineDirty(line);
+
+  if (prevId !== null) {
+    deactivateLineEdge(state, line, prevId, oldStationId);
+    activateCorridorForLine(state, line, prevId, newStationId);
+  }
+  if (nextId !== null) {
+    deactivateLineEdge(state, line, oldStationId, nextId);
+    activateCorridorForLine(state, line, newStationId, nextId);
+  }
+
+  checkFreightOnboarding(state, newStationId);
+  for (const tr of state.trains) {
+    if (tr.lineId === lineId) {
+      updateTrainSpinePoses(state, tr);
+    }
+  }
+  return { ok: true };
+}
+
 export function clearLine(state, lineId) {
   const line = state.lines[lineId];
   if (!line) return { ok: false, reason: 'Line not found' };
@@ -620,6 +730,7 @@ function updateTrainSpinePoses(state, tr) {
     const y = st ? st.y : tr.y || 0;
     const angle = tr.angle || 0;
     tr.consistStartU = 0;
+    tr.spineU = 0;
     tr.spineTotalLength = 0;
     tr.unitPoses = Array.from({ length: unitCount }, (_, i) => ({
       x: x - Math.cos(angle) * i * CONFIG.CAR_SPACING,
@@ -677,6 +788,9 @@ function updateTrainSpinePoses(state, tr) {
   }
 
   tr.consistStartU = consistStartU;
+  tr.spineU = spine.isLoop
+    ? (((consistStartU + span * 0.5) % total) + total) % total
+    : consistStartU + span * 0.5;
   tr.spineTotalLength = total;
   tr.unitPoses = computeTrainUnitPoses(
     spine,
@@ -707,6 +821,152 @@ function computeInitialTrainAngle(state, line, stationIndex, direction) {
   const nextSt = state.stationById.get(toId);
   if (!nextSt) return 0;
   return Math.atan2(nextSt.y - st.y, nextSt.x - st.x);
+}
+
+function pickBestDirectionAtU(state, line, spine, u) {
+  const existing = state.trains.filter((t) => t.lineId === line.id);
+  if (existing.length === 0) {
+    if (!spine.isLoop && spine.totalLength > 0 && u > spine.totalLength * 0.7) {
+      return -1;
+    }
+    return 1;
+  }
+
+  const total = spine.totalLength || 1;
+  const scoreDir = (dir) => {
+    let minSameDist = Infinity;
+    let sameCount = 0;
+    let oppCount = 0;
+    for (const other of existing) {
+      const otherU = other.spineU ?? 0;
+      let d = Math.abs(otherU - u);
+      if (spine.isLoop) d = Math.min(d, total - d);
+      if (other.direction === dir) {
+        sameCount++;
+        if (d < minSameDist) minSameDist = d;
+      } else {
+        oppCount++;
+      }
+    }
+    return minSameDist + (oppCount > sameCount ? 140 : 0);
+  };
+
+  return scoreDir(1) >= scoreDir(-1) ? 1 : -1;
+}
+
+function placeTrainOnLineAtWorldPos(state, train, line, wx, wy) {
+  const spine = ensureLineSpine(state, line);
+  if (!spine || spine.points.length < 2 || spine.totalLength <= 0) {
+    train.lineId = line.id;
+    train.stationIndex = 0;
+    train.direction = 1;
+    train.state = 'atStation';
+    train.corridorKey = null;
+    updateTrainSpinePoses(state, train);
+    return;
+  }
+
+  const proj = projectPointOntoSpine(spine, wx, wy);
+  const u = proj.u;
+  const direction = pickBestDirectionAtU(state, line, spine, u);
+  const n = line.stations.length;
+
+  // Check if cursor is right over a station on this line
+  let nearestStIdx = 0;
+  let nearestStDist = Infinity;
+  for (let i = 0; i < n; i++) {
+    const stU = spine.stationU[i] ?? 0;
+    let d = Math.abs(stU - u);
+    if (spine.isLoop) d = Math.min(d, spine.totalLength - d);
+    if (d < nearestStDist) {
+      nearestStDist = d;
+      nearestStIdx = i;
+    }
+  }
+
+  const legIdx = Math.max(0, Math.min(spine.isLoop ? n - 1 : n - 2, proj.legIndex));
+  const idxA = legIdx;
+  const idxB = (legIdx + 1) % n;
+  const fromIdx = direction >= 0 ? idxA : idxB;
+  const toIdx = direction >= 0 ? idxB : idxA;
+  const fromId = line.stations[fromIdx];
+  const toId = line.stations[toIdx];
+  const cKey = edgeKey(fromId, toId);
+  const corridor = state.corridors.get(cKey);
+  const dir = corridor && fromId === corridor.aId ? 'AtoB' : 'BtoA';
+
+  const uStart = spine.stationU[idxA] ?? 0;
+  const uEnd = idxB === 0 && spine.isLoop ? spine.totalLength : (spine.stationU[idxB] ?? spine.totalLength);
+  const legLen = Math.max(1, uEnd - uStart);
+  const rawFrac = Math.max(0.05, Math.min(0.95, (u - uStart) / legLen));
+  const frac = direction >= 0 ? rawFrac : 1 - rawFrac;
+
+  const canPlaceInCorridor =
+    corridor &&
+    nearestStDist > CONFIG.STATION_RADIUS + 8 &&
+    (corridor.isDoubleTrack || corridor.lockedDirection === null || corridor.lockedDirection === dir);
+
+  if (canPlaceInCorridor) {
+    const candidateS = frac * corridor.totalLength;
+    const minReq = getConsistLength(train) + CONFIG.HEADWAY_BUFFER;
+    const crowded = state.trains.some((other) => {
+      if (other.id === train.id || other.lineId !== line.id) return false;
+      const otherU = other.spineU ?? 0;
+      let d = Math.abs(otherU - u);
+      if (spine.isLoop) d = Math.min(d, spine.totalLength - d);
+      return d < minReq * 0.75;
+    });
+
+    if (!crowded) {
+      if (!corridor.isDoubleTrack) {
+        corridor.lockedDirection = dir;
+      }
+      train.lineId = line.id;
+      train.state = 'traversing';
+      train.exchangedAtStop = false;
+      train.corridorKey = cKey;
+      train.corridorDir = dir;
+      train.fromStationId = fromId;
+      train.toStationId = toId;
+      train.direction = direction;
+      train.stationIndex = toIdx;
+      train.s = candidateS;
+      train.lane = 0;
+      train.lateralOffset = 0;
+      train.currentSpeed = 0;
+      corridor.trains.push(train);
+      updateTrainSpinePoses(state, train);
+      return;
+    }
+  }
+
+  // Fallback: place cleanly at the nearest station on the line
+  const st = state.stationById.get(line.stations[nearestStIdx]);
+  const dwellMult = st?.isInterchange ? CONFIG.INTERCHANGE_DWELL_MULT : 1;
+  let stDir = direction;
+  if (!line.isLoop) {
+    if (nearestStIdx === 0) stDir = 1;
+    else if (nearestStIdx === n - 1) stDir = -1;
+  }
+  train.lineId = line.id;
+  train.corridorKey = null;
+  train.fromStationId = null;
+  train.toStationId = null;
+  train.s = 0;
+  train.state = 'atStation';
+  train.stationIndex = nearestStIdx;
+  train.direction = stDir;
+  train.dwellTimer = 0.25 * dwellMult;
+  train.exchangedAtStop = false;
+  train.lane = 0;
+  train.lateralOffset = 0;
+  train.currentSpeed = 0;
+  train.angle = computeInitialTrainAngle(state, line, nearestStIdx, stDir);
+  if (st) {
+    train.x = st.x;
+    train.y = st.y;
+  }
+  updateTrainSpinePoses(state, train);
 }
 
 export function deployTrainOnLine(state, type, lineId, stationId = null) {
@@ -742,6 +1002,7 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
     s: 0,
     currentSpeed: 0,
     consistStartU: 0,
+    spineU: 0,
     spineTotalLength: 0,
     unitPoses: [],
     exhaustTimer: 0,
@@ -752,6 +1013,45 @@ export function deployTrainOnLine(state, type, lineId, stationId = null) {
     angle,
   };
   updateTrainSpinePoses(state, train);
+  state.trains.push(train);
+  return { ok: true, train };
+}
+
+export function deployTrainAtWorldPos(state, type, lineId, wx, wy) {
+  const line = state.lines[lineId];
+  if (!line || line.stations.length < 2) return { ok: false, reason: 'Line needs 2+ stations' };
+  if (state.inventory[type] <= 0) return { ok: false, reason: `No ${type} trains available` };
+
+  state.inventory[type] -= 1;
+  const train = {
+    id: state.nextTrainId++,
+    type,
+    lineId,
+    cars: CONFIG.TRAIN_DEFAULT_CARS,
+    cargo: [],
+    state: 'atStation',
+    stationIndex: 0,
+    direction: 1,
+    dwellTimer: 0.25,
+    exchangedAtStop: false,
+    corridorKey: null,
+    corridorDir: 'AtoB',
+    fromStationId: null,
+    toStationId: null,
+    s: 0,
+    currentSpeed: 0,
+    consistStartU: 0,
+    spineU: 0,
+    spineTotalLength: 0,
+    unitPoses: [],
+    exhaustTimer: 0,
+    lane: 0,
+    lateralOffset: 0,
+    x: wx,
+    y: wy,
+    angle: 0,
+  };
+  placeTrainOnLineAtWorldPos(state, train, line, wx, wy);
   state.trains.push(train);
   return { ok: true, train };
 }
@@ -823,6 +1123,23 @@ export function moveTrainToLine(state, trainId, targetLineId, stationId = null) 
   tr.angle = angle;
   updateTrainSpinePoses(state, tr);
   return { ok: true };
+}
+
+export function moveTrainToWorldPos(state, trainId, lineId, wx, wy) {
+  const tr = state.trains.find((t) => t.id === trainId);
+  const line = state.lines[lineId];
+  if (!tr || !line || line.stations.length < 2) return { ok: false };
+  removeTrainFromCorridorQueues(state, tr);
+  if (tr.corridorKey) {
+    const corr = state.corridors.get(tr.corridorKey);
+    if (corr) {
+      corr.trains = corr.trains.filter((t) => t.id !== tr.id);
+      if (corr.trains.length === 0) corr.lockedDirection = null;
+      releaseCorridorIfUnused(state, corr);
+    }
+  }
+  placeTrainOnLineAtWorldPos(state, tr, line, wx, wy);
+  return { ok: true, train: tr };
 }
 
 export function applyStationUpgrade(state, stationId, upgradeType) {
@@ -897,6 +1214,9 @@ export function reclaimCorridorUpgrade(state, corridorKey, upgradeType) {
   }
 
   if (upgradeType === 'tunnel' && corridor.hasTunnel) {
+    if (corridor.hasMountainTunnel) {
+      return { ok: false, reason: 'Mountain corridor requires Tunnel' };
+    }
     corridor.hasTunnel = false;
     state.inventory.tunnel += 1;
     return { ok: true };
@@ -940,8 +1260,10 @@ function canEnterCorridor(corridor, train, dir) {
   if (corridor.isDoubleTrack) {
     // Dedicated directional lane: only check headway against same-dir trains on lane 0
     for (const other of corridor.trains) {
-      if (other.corridorDir === dir && other.lane === 0 && other.s < CONFIG.MIN_HEADWAY) {
-        return false;
+      if (other.corridorDir === dir && other.lane === 0) {
+        const minGap =
+          (getConsistLength(train) + getConsistLength(other)) * 0.5 + CONFIG.HEADWAY_BUFFER;
+        if (other.s < minGap) return false;
       }
     }
     return true;
@@ -964,8 +1286,10 @@ function canEnterCorridor(corridor, train, dir) {
       return false;
     }
     for (const other of corridor.trains) {
-      if (other.corridorDir === dir && other.s < CONFIG.MIN_HEADWAY) {
-        return false;
+      if (other.corridorDir === dir) {
+        const minGap =
+          (getConsistLength(train) + getConsistLength(other)) * 0.5 + CONFIG.HEADWAY_BUFFER;
+        if (other.s < minGap) return false;
       }
     }
     return true;
@@ -1239,26 +1563,66 @@ function handleStationExchange(state, train, station, hooks) {
   return didActivity;
 }
 
+export function continueEndlessMode(state) {
+  state.endlessMode = true;
+  for (const st of state.stations) {
+    st.overflowTimer = 0;
+    st.warningPulseTimer = 0;
+  }
+  state.phase = 'playing';
+  state.speed = Math.max(1, state.savedSpeedBeforeModal || 1);
+}
+
+function updateNeedsFreightCues(state) {
+  for (const st of state.stations) {
+    if (st.kind !== 'resource' && st.kind !== 'factory') {
+      st.needsFreightCue = false;
+      continue;
+    }
+    const isConnected = state.lines.some((l) => l.stations.includes(st.id));
+    if (!isConnected) {
+      st.needsFreightCue = false;
+      continue;
+    }
+    const hasWaiting =
+      (st.inputBuffer || 0) > 0 ||
+      st.queue.some((tok) => tok.kind === 'raw' || tok.kind === 'goods');
+    if (!hasWaiting) {
+      st.needsFreightCue = false;
+      continue;
+    }
+    const hasFreightTrain = state.trains.some((tr) => {
+      if (tr.type !== 'freight') return false;
+      const line = state.lines[tr.lineId];
+      return line && line.stations.includes(st.id);
+    });
+    st.needsFreightCue = !hasFreightTrain;
+  }
+}
+
 function stepDemandAndSpawns(state, simDt, hooks) {
   // Progressive station spawning
   if (state.nextSpawnIndex < state.pendingSpawns.length) {
     state.spawnElapsed += simDt;
     if (state.spawnElapsed >= state.nextSpawnInterval) {
       state.spawnElapsed = 0;
-      state.nextSpawnInterval = Math.max(13.5, 23.0 - state.week * 0.95);
+      state.nextSpawnInterval = Math.max(23, 36 - state.week * 1.15);
       const spawned = spawnNextStation(state);
-      if (spawned) hooks?.onStationSpawn?.(spawned);
+      if (spawned) {
+        spawned.spawnTimer = Math.max(spawned.spawnTimer || 0, 6.5);
+        hooks?.onStationSpawn?.(spawned);
+      }
     }
   }
 
   // Demand generation, factory processing & overflow timers
-  const demandRateMult = 1 + (state.week - 1) * 0.16;
+  const demandRateMult = 1 + (state.week - 1) * 0.085;
 
   for (const st of state.stations) {
     if (st.kind === 'resource') {
       st.spawnTimer -= simDt * demandRateMult;
       if (st.spawnTimer <= 0) {
-        st.spawnTimer = 8.6 * (0.85 + state.rng() * 0.35);
+        st.spawnTimer = 11.8 * (0.85 + state.rng() * 0.35);
         st.queue.push(createToken(state, 'raw'));
       }
     } else if (st.kind === 'factory') {
@@ -1288,7 +1652,7 @@ function stepDemandAndSpawns(state, simDt, hooks) {
     } else if (st.kind === 'settlement') {
       st.spawnTimer -= simDt * demandRateMult;
       if (st.spawnTimer <= 0) {
-        const baseInterval = st.tier === 3 ? 7.0 : 7.8;
+        const baseInterval = st.tier === 3 ? 10.2 : 11.2;
         st.spawnTimer = baseInterval * (0.85 + state.rng() * 0.35);
 
         if (st.tier < 3) {
@@ -1313,13 +1677,16 @@ function stepDemandAndSpawns(state, simDt, hooks) {
       }
     }
 
-    if (st.queue.length > st.capacity) {
+    if (state.endlessMode) {
+      st.overflowTimer = 0;
+      st.warningPulseTimer = 0;
+    } else if (st.queue.length > st.capacity) {
       st.overflowTimer += simDt;
       if (st.overflowTimer >= CONFIG.OVERFLOW_DURATION) {
         state.phase = 'gameover';
         state.speed = 0;
         const label = st.name || st.subtype || 'Station';
-        state.gameOverReason = `${label} exceeded its ${st.capacity}-unit capacity for 30 seconds.`;
+        state.gameOverReason = `${label} exceeded its ${st.capacity}-unit capacity for ${Math.round(CONFIG.OVERFLOW_DURATION)} seconds.`;
         hooks?.onGameOver?.();
         return;
       }
@@ -1340,6 +1707,8 @@ function stepDemandAndSpawns(state, simDt, hooks) {
       st.warningPulseTimer = 0;
     }
   }
+
+  updateNeedsFreightCues(state);
 }
 
 function shouldBrakeForStop(state, tr, line, toStation) {
@@ -1371,6 +1740,49 @@ function shouldBrakeForStop(state, tr, line, toStation) {
   return false;
 }
 
+function getForwardSpineDistance(spine, fromU, toU, direction) {
+  if (!spine || spine.totalLength <= 0) return Infinity;
+  const total = spine.totalLength;
+  if (spine.isLoop) {
+    const raw = direction >= 0 ? toU - fromU : fromU - toU;
+    const d = ((raw % total) + total) % total;
+    return d === 0 ? total : d;
+  }
+  const delta = direction >= 0 ? toU - fromU : fromU - toU;
+  return delta > 0 ? delta : Infinity;
+}
+
+function computeTargetLateralOffset(state, tr, line, spine, corridor) {
+  if (corridor?.isDoubleTrack) {
+    return tr.lane === 1
+      ? -tr.direction * CONFIG.OVERTAKE_OFFSET
+      : tr.direction * CONFIG.PLATFORM_PASS_OFFSET;
+  }
+  if (spine && spine.totalLength > 0) {
+    const myU = tr.spineU ?? 0;
+    for (const other of state.trains) {
+      if (other.id === tr.id || other.lineId !== tr.lineId || other.direction === tr.direction) {
+        continue;
+      }
+      const otherU = other.spineU ?? 0;
+      let distU = Math.abs(otherU - myU);
+      if (spine.isLoop) {
+        distU = Math.min(distU, spine.totalLength - distU);
+      }
+      if (distU <= 130) {
+        return tr.direction * CONFIG.PLATFORM_PASS_OFFSET;
+      }
+    }
+  }
+  return 0;
+}
+
+function dampTrainLateralOffset(state, tr, line, spine, corridor, simDt) {
+  const targetLateral = computeTargetLateralOffset(state, tr, line, spine, corridor);
+  if (typeof tr.lateralOffset !== 'number') tr.lateralOffset = 0;
+  tr.lateralOffset += (targetLateral - tr.lateralOffset) * Math.min(1, simDt * 8.0);
+}
+
 function stepTrains(state, simDt, hooks) {
   for (let i = state.trains.length - 1; i >= 0; i--) {
     const tr = state.trains[i];
@@ -1380,6 +1792,8 @@ function stepTrains(state, simDt, hooks) {
       reclaimTrainToInventory(state, tr.id);
       continue;
     }
+
+    const spine = ensureLineSpine(state, line);
 
     if (tr.state === 'atStation') {
       tr.currentSpeed = 0;
@@ -1394,6 +1808,7 @@ function stepTrains(state, simDt, hooks) {
       }
       tr.dwellTimer -= simDt;
       if (tr.dwellTimer > 0) {
+        dampTrainLateralOffset(state, tr, line, spine, null, simDt);
         updateTrainSpinePoses(state, tr);
         continue;
       }
@@ -1404,6 +1819,7 @@ function stepTrains(state, simDt, hooks) {
       tr.currentSpeed = 0;
       const next = getNextStop(line, tr.stationIndex, tr.direction);
       if (!next) {
+        dampTrainLateralOffset(state, tr, line, spine, null, simDt);
         updateTrainSpinePoses(state, tr);
         continue;
       }
@@ -1418,6 +1834,7 @@ function stepTrains(state, simDt, hooks) {
 
       const dir = fromId === corridor.aId ? 'AtoB' : 'BtoA';
       if (!canEnterCorridor(corridor, tr, dir)) {
+        dampTrainLateralOffset(state, tr, line, spine, null, simDt);
         updateTrainSpinePoses(state, tr);
         continue;
       }
@@ -1462,15 +1879,40 @@ function stepTrains(state, simDt, hooks) {
       const maxSpeed = baseSpeed * hillMult;
       let targetSpeed = maxSpeed;
 
-      let leader = null;
-      let minGap = Infinity;
+      // Same-corridor leader (including cross-line traffic on shared track)
+      let corrLeader = null;
+      let corrGap = Infinity;
+      let corrLeaderMinGap = 0;
       for (const other of corridor.trains) {
         if (other.id === tr.id) continue;
         if (other.corridorDir === tr.corridorDir && other.lane === tr.lane && other.s > tr.s) {
           const gap = other.s - tr.s;
-          if (gap < minGap) {
-            minGap = gap;
-            leader = other;
+          if (gap < corrGap) {
+            corrGap = gap;
+            corrLeader = other;
+            corrLeaderMinGap =
+              (getConsistLength(tr) + getConsistLength(other)) * 0.5 + CONFIG.HEADWAY_BUFFER;
+          }
+        }
+      }
+
+      // Same-line, same-direction spine headway against ALL trains ahead (including atStation / waitingBlock)
+      let spineLeader = null;
+      let spineGap = Infinity;
+      let spineMinGap = 0;
+      const isOvertaking = corridor.isDoubleTrack && tr.lane === 1;
+      if (!isOvertaking && spine && spine.totalLength > 0) {
+        const myU = tr.spineU ?? 0;
+        for (const other of state.trains) {
+          if (other.id === tr.id) continue;
+          if (other.lineId !== tr.lineId || other.direction !== tr.direction) continue;
+          if (other.lane === 1 && corridor.isDoubleTrack) continue;
+          const d = getForwardSpineDistance(spine, myU, other.spineU ?? 0, tr.direction);
+          if (d < spineGap) {
+            spineGap = d;
+            spineLeader = other;
+            spineMinGap =
+              (getConsistLength(tr) + getConsistLength(other)) * 0.5 + CONFIG.HEADWAY_BUFFER;
           }
         }
       }
@@ -1479,23 +1921,21 @@ function stepTrains(state, simDt, hooks) {
         corridor.isDoubleTrack &&
         tr.type === 'express' &&
         tr.lane === 0 &&
-        leader &&
-        leader.type === 'freight' &&
-        minGap < CONFIG.OVERTAKE_TRIGGER_DIST
+        corrLeader &&
+        corrLeader.type === 'freight' &&
+        corrGap < Math.max(CONFIG.OVERTAKE_TRIGGER_DIST, corrLeaderMinGap + 12)
       ) {
         const oppBusy = corridor.trains.some((o) => o.corridorDir !== tr.corridorDir);
         if (!oppBusy) {
           tr.lane = 1;
-          leader = null;
+          corrLeader = null;
         }
       } else if (tr.lane === 1) {
-        const lane0Blocked = corridor.trains.some(
-          (o) =>
-            o.id !== tr.id &&
-            o.corridorDir === tr.corridorDir &&
-            o.lane === 0 &&
-            Math.abs(o.s - tr.s) < CONFIG.SAFE_GAP + 14
-        );
+        const lane0Blocked = corridor.trains.some((o) => {
+          if (o.id === tr.id || o.corridorDir !== tr.corridorDir || o.lane !== 0) return false;
+          const req = (getConsistLength(tr) + getConsistLength(o)) * 0.5 + CONFIG.HEADWAY_BUFFER;
+          return Math.abs(o.s - tr.s) < req + 14;
+        });
         if (!lane0Blocked) {
           tr.lane = 0;
         }
@@ -1508,12 +1948,22 @@ function stepTrains(state, simDt, hooks) {
         targetSpeed = Math.min(targetSpeed, brakeTarget);
       }
 
-      if (leader && minGap < CONFIG.SAFE_GAP + 28) {
-        const leaderSpeed = leader.currentSpeed ?? maxSpeed;
+      if (corrLeader && corrGap < corrLeaderMinGap + 28) {
+        const leaderSpeed = corrLeader.currentSpeed ?? maxSpeed;
         const followTarget =
-          minGap <= CONFIG.SAFE_GAP
+          corrGap <= corrLeaderMinGap
             ? 0
-            : leaderSpeed * ((minGap - CONFIG.SAFE_GAP) / 28);
+            : leaderSpeed * ((corrGap - corrLeaderMinGap) / 28);
+        targetSpeed = Math.min(targetSpeed, followTarget);
+      }
+
+      if (spineLeader && spineGap < spineMinGap + 28) {
+        const leaderSpeed =
+          spineLeader.state === 'traversing' ? (spineLeader.currentSpeed ?? maxSpeed) : 0;
+        const followTarget =
+          spineGap <= spineMinGap
+            ? 0
+            : leaderSpeed * ((spineGap - spineMinGap) / 28);
         targetSpeed = Math.min(targetSpeed, followTarget);
       }
 
@@ -1525,8 +1975,12 @@ function stepTrains(state, simDt, hooks) {
       }
 
       let nextS = tr.s + tr.currentSpeed * simDt;
-      if (leader && nextS > leader.s - CONFIG.SAFE_GAP) {
-        nextS = Math.max(tr.s, leader.s - CONFIG.SAFE_GAP);
+      if (corrLeader && nextS > corrLeader.s - corrLeaderMinGap) {
+        nextS = Math.max(tr.s, corrLeader.s - corrLeaderMinGap);
+      }
+      if (spineLeader && spineGap - (nextS - tr.s) < spineMinGap) {
+        const allowedAdvance = Math.max(0, spineGap - spineMinGap);
+        nextS = Math.min(nextS, tr.s + allowedAdvance);
       }
       if (nextS > total) {
         nextS = total;
@@ -1534,7 +1988,30 @@ function stepTrains(state, simDt, hooks) {
 
       tr.s = nextS;
 
-      if (tr.s >= total) {
+      let stationOccupied = false;
+      if (tr.s >= total && spine) {
+        const toIdx = line.stations.indexOf(tr.toStationId);
+        const stationU = toIdx >= 0 ? (spine.stationU[toIdx] ?? 0) : null;
+        if (stationU !== null) {
+          for (const other of state.trains) {
+            if (other.id === tr.id) continue;
+            if (other.lineId !== tr.lineId || other.direction !== tr.direction) continue;
+            if (other.state === 'traversing') continue;
+            const reqGap =
+              (getConsistLength(tr) + getConsistLength(other)) * 0.5 + CONFIG.HEADWAY_BUFFER;
+            let du = Math.abs((other.spineU ?? 0) - stationU);
+            if (spine.isLoop) du = Math.min(du, spine.totalLength - du);
+            if (du < reqGap * 0.85) {
+              stationOccupied = true;
+              tr.s = Math.max(0, total - reqGap);
+              tr.currentSpeed = 0;
+              break;
+            }
+          }
+        }
+      }
+
+      if (tr.s >= total && !stationOccupied) {
         corridor.trains = corridor.trains.filter((t) => t.id !== tr.id);
         if (corridor.trains.length === 0) {
           corridor.lockedDirection = null;
@@ -1553,7 +2030,6 @@ function stepTrains(state, simDt, hooks) {
         const arrivedStation = state.stationById.get(tr.toStationId);
         tr.corridorKey = null;
         tr.lane = 0;
-        tr.lateralOffset = 0;
         tr.currentSpeed = 0;
 
         if (!line || line.stations.length < 2) {
@@ -1568,6 +2044,7 @@ function stepTrains(state, simDt, hooks) {
         tr.exchangedAtStop = false;
         const dwellMult = arrivedStation?.isInterchange ? CONFIG.INTERCHANGE_DWELL_MULT : 1;
         tr.dwellTimer = 0.2 * dwellMult;
+        dampTrainLateralOffset(state, tr, line, spine, null, simDt);
         updateTrainSpinePoses(state, tr);
         if (arrivedStation) {
           const did = handleStationExchange(state, tr, arrivedStation, hooks);
@@ -1575,12 +2052,7 @@ function stepTrains(state, simDt, hooks) {
           tr.exchangedAtStop = true;
         }
       } else {
-        const targetLateral = corridor.isDoubleTrack
-          ? tr.lane === 1
-            ? -CONFIG.OVERTAKE_OFFSET
-            : 4.5
-          : 0;
-        tr.lateralOffset += (targetLateral - tr.lateralOffset) * 0.2;
+        dampTrainLateralOffset(state, tr, line, spine, corridor, simDt);
         updateTrainSpinePoses(state, tr);
 
         tr.exhaustTimer = (tr.exhaustTimer ?? 0) - simDt;

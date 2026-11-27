@@ -6,7 +6,7 @@ import {
   worldToScreen,
   zoomCameraAtScreenPoint,
 } from './state.js';
-import { clearLine } from './simulation.js';
+import { clearLine, continueEndlessMode } from './simulation.js';
 
 function createAudioEngine(state) {
   let ctx = null;
@@ -86,6 +86,9 @@ function createAudioEngine(state) {
         playTone(880.0, 0.28, 0.05, 'sine', 0.12);
       }
     },
+    onLineStep() {
+      playTone(622.25, 0.065, 0.024, 'sine', 0);
+    },
     onOverflowTick(_st, frac = 0.5) {
       const nowMs = performance.now();
       const cooldownMs = Math.max(480, 1250 - frac * 700);
@@ -105,15 +108,16 @@ function createAudioEngine(state) {
 const DRAFT_LOCOS = [
   {
     id: 'express',
-    label: 'Express',
+    label: 'Passenger',
     svg: `
-      <svg viewBox="0 0 64 40" width="60" height="38" aria-hidden="true">
-        <rect x="4" y="14" width="20" height="14" rx="3" fill="currentColor"/>
-        <rect x="8" y="18" width="4.5" height="4.5" rx="1" fill="var(--paper-bg)"/>
-        <rect x="15.5" y="18" width="4.5" height="4.5" rx="1" fill="var(--paper-bg)"/>
-        <line x1="24" y1="22" x2="29" y2="22" stroke="currentColor" stroke-width="2.6"/>
-        <path d="M29,28 L29,12 Q29,9 32,9 L49,9 L59,20 L59,28 Z" fill="currentColor"/>
-        <path d="M34,13.5 L47,13.5 L52,18.5 L34,18.5 Z" fill="var(--paper-bg)" opacity="0.9"/>
+      <svg viewBox="0 0 64 40" width="62" height="38" aria-hidden="true">
+        <rect x="3" y="13" width="22" height="14" rx="7" fill="currentColor"/>
+        <circle cx="8.8" cy="20" r="2" fill="var(--paper-bg)"/>
+        <circle cx="14" cy="20" r="2" fill="var(--paper-bg)"/>
+        <circle cx="19.2" cy="20" r="2" fill="var(--paper-bg)"/>
+        <line x1="25" y1="20" x2="30" y2="20" stroke="currentColor" stroke-width="2.6"/>
+        <rect x="30" y="12" width="31" height="16" rx="8" fill="currentColor"/>
+        <path d="M49,14.8 Q57.5,15.4 58.2,20 Q57.5,24.6 49,25.2 Z" fill="var(--paper-bg)" opacity="0.92"/>
       </svg>
     `,
   },
@@ -121,13 +125,15 @@ const DRAFT_LOCOS = [
     id: 'freight',
     label: 'Freight',
     svg: `
-      <svg viewBox="0 0 64 40" width="60" height="38" aria-hidden="true">
-        <path d="M4,16 L4,28 L24,28 L24,16 L20,16 L20,23 L8,23 L8,16 Z" fill="currentColor"/>
-        <rect x="9" y="13" width="6.5" height="7" rx="1.2" fill="#C2410C"/>
-        <rect x="16.5" y="14.5" width="5.5" height="5.5" rx="1.2" fill="#EAB308"/>
-        <line x1="24" y1="22" x2="29" y2="22" stroke="currentColor" stroke-width="2.6"/>
-        <path d="M29,28 L29,15 L39,15 L39,10 L51,10 L51,16 L59,16 L59,28 Z" fill="currentColor"/>
-        <rect x="42" y="13" width="6" height="5" rx="1" fill="var(--paper-bg)" opacity="0.9"/>
+      <svg viewBox="0 0 64 40" width="62" height="38" aria-hidden="true">
+        <rect x="3" y="12" width="24" height="16" rx="2.6" fill="#1E293B" stroke="currentColor" stroke-width="2"/>
+        <rect x="6" y="14.5" width="5.2" height="11" rx="0.8" fill="#C2410C"/>
+        <rect x="12.4" y="14.5" width="5.2" height="11" rx="0.8" fill="#EAB308"/>
+        <rect x="18.8" y="14.5" width="5.2" height="11" rx="0.8" fill="#C2410C"/>
+        <line x1="27" y1="20" x2="31" y2="20" stroke="#1E293B" stroke-width="2.8"/>
+        <rect x="31" y="12" width="30" height="16" rx="2.6" fill="#1E293B" stroke="currentColor" stroke-width="2"/>
+        <rect x="35" y="15.2" width="8.5" height="9.6" rx="1.2" fill="currentColor"/>
+        <rect x="47.5" y="14.8" width="7" height="10.4" rx="1.2" fill="var(--paper-bg)" opacity="0.92"/>
       </svg>
     `,
   },
@@ -253,6 +259,7 @@ export function setupUI(state, callbacks) {
   const goodsEl = document.getElementById('hud-goods');
   const citiesEl = document.getElementById('hud-cities');
   const weekdayEl = document.getElementById('hud-weekday');
+  const endlessPillEl = document.getElementById('hud-endless');
   const clockHandEl = document.getElementById('clock-hand-group');
   const hintEl = document.getElementById('hint-banner');
   const edgeAlertsEl = document.getElementById('edge-alerts');
@@ -264,8 +271,11 @@ export function setupUI(state, callbacks) {
   const helpBtn = document.getElementById('btn-help');
   const helpModal = document.getElementById('help-modal');
   const helpCloseBtn = document.getElementById('btn-help-close');
+  const helpSeedEl = document.getElementById('help-seed');
+  const helpNewMapBtn = document.getElementById('btn-help-new-map');
 
   const gameOverModal = document.getElementById('gameover-modal');
+  const continueEndlessBtn = document.getElementById('btn-continue-endless');
   const finalDaysEl = document.getElementById('final-days');
   const finalDelivEl = document.getElementById('final-deliveries');
   const finalGoodsEl = document.getElementById('final-goods');
@@ -490,6 +500,17 @@ export function setupUI(state, callbacks) {
     }
   });
 
+  continueEndlessBtn?.addEventListener('click', () => {
+    continueEndlessMode(state);
+    showHint(state, 'Endless Mode active — build without limits!');
+    syncUI();
+  });
+  helpNewMapBtn?.addEventListener('click', () => {
+    helpModal.classList.add('hidden');
+    activeDraft = null;
+    draftModal.classList.add('hidden');
+    callbacks.onRestart?.(Math.floor(Math.random() * 0xffffffff));
+  });
   document.getElementById('btn-retry-seed')?.addEventListener('click', () => {
     activeDraft = null;
     draftModal.classList.add('hidden');
@@ -585,6 +606,12 @@ export function setupUI(state, callbacks) {
 
     const dayIdx = ((state.day - 1) % CONFIG.DAY_NAMES.length + CONFIG.DAY_NAMES.length) % CONFIG.DAY_NAMES.length;
     weekdayEl.textContent = `W${state.week} · ${CONFIG.DAY_NAMES[dayIdx]}`;
+    if (endlessPillEl) {
+      endlessPillEl.classList.toggle('hidden', !state.endlessMode);
+    }
+    if (helpSeedEl) {
+      helpSeedEl.textContent = String(state.seed ?? '-');
+    }
 
     if (clockHandEl) {
       clockHandEl.setAttribute('transform', `rotate(${(state.dayProgress * 360).toFixed(1)} 18 18)`);
@@ -657,6 +684,7 @@ export function setupUI(state, callbacks) {
       onDelivery: (kind) => audio.onDelivery(kind),
       onStationSpawn: () => audio.onStationSpawn(),
       onCityGrow: () => audio.onCityGrow(),
+      onLineStep: () => audio.onLineStep(),
       onOverflowTick: (st, frac) => audio.onOverflowTick(st, frac),
       onWeekEnd: () => {
         audio.onWeekEnd();

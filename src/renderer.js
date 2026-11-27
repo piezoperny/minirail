@@ -11,6 +11,7 @@ import {
   buildOctilinearPoints,
   computePolylineLengths,
   computeStationQueueAngle,
+  countMountainCrossings,
   countRiverCrossings,
   extractSubPolyline,
   getLineTBarPose,
@@ -82,10 +83,45 @@ export function drawShape(ctx, shape, x, y, r, fill, stroke, lineWidth = 2.6) {
   ctx.restore();
 }
 
+function fillPolygon(ctx, poly) {
+  if (!poly || poly.length < 3) return;
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for (let i = 1; i < poly.length; i++) {
+    ctx.lineTo(poly[i].x, poly[i].y);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function strokePolygon(ctx, poly) {
+  if (!poly || poly.length < 3) return;
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for (let i = 1; i < poly.length; i++) {
+    ctx.lineTo(poly[i].x, poly[i].y);
+  }
+  ctx.closePath();
+  ctx.stroke();
+}
+
 function drawHills(ctx, hills, pal) {
   if (!hills || hills.length === 0) return;
   ctx.save();
+  ctx.lineJoin = 'round';
   for (const h of hills) {
+    if (Array.isArray(h.ringsPoly) && h.ringsPoly.length > 0) {
+      for (let i = 0; i < h.ringsPoly.length; i++) {
+        const ring = h.ringsPoly[i];
+        if (!ring || ring.length < 3) continue;
+        ctx.fillStyle = pal.hillFill;
+        fillPolygon(ctx, ring);
+        ctx.strokeStyle = pal.hillStroke;
+        ctx.lineWidth = i === 0 ? 1.4 : 1.0;
+        strokePolygon(ctx, ring);
+      }
+      continue;
+    }
     ctx.save();
     ctx.translate(h.x, h.y);
     ctx.rotate(h.angle);
@@ -105,25 +141,99 @@ function drawHills(ctx, hills, pal) {
   ctx.restore();
 }
 
-function drawRiver(ctx, state, pal) {
-  const river = state.river;
-  const pts = river?.points;
-  if (!pts || pts.length < 2) return;
+function drawMountains(ctx, mountains, pal, isNight) {
+  if (!mountains || mountains.length === 0) return;
+  ctx.save();
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
 
+  for (const m of mountains) {
+    // 1. Outer massif footprint
+    if (Array.isArray(m.outerPoly) && m.outerPoly.length >= 3) {
+      ctx.fillStyle = pal.mountainOuter;
+      fillPolygon(ctx, m.outerPoly);
+      ctx.strokeStyle = isNight ? 'rgba(148, 163, 184, 0.24)' : 'rgba(68, 64, 60, 0.28)';
+      ctx.lineWidth = 1.3;
+      strokePolygon(ctx, m.outerPoly);
+    }
+
+    // 2. Mid-elevation stone tier
+    if (Array.isArray(m.innerPoly) && m.innerPoly.length >= 3) {
+      ctx.fillStyle = pal.mountainInner;
+      fillPolygon(ctx, m.innerPoly);
+      ctx.strokeStyle = isNight ? 'rgba(203, 213, 225, 0.14)' : 'rgba(68, 64, 60, 0.18)';
+      ctx.lineWidth = 1.0;
+      strokePolygon(ctx, m.innerPoly);
+    }
+
+    // 3. Upper summit polygon
+    if (Array.isArray(m.peakPoly) && m.peakPoly.length >= 3) {
+      ctx.fillStyle = pal.mountainPeak;
+      fillPolygon(ctx, m.peakPoly);
+    }
+
+    // 4. Subtle facet shading along one flank of the ridgeline
+    if (Array.isArray(m.ridgeLine) && m.ridgeLine.length >= 2 && Array.isArray(m.innerPoly) && m.innerPoly.length >= 4) {
+      const rStart = m.ridgeLine[0];
+      const rMid = m.ridgeLine[Math.floor(m.ridgeLine.length / 2)];
+      const rEnd = m.ridgeLine[m.ridgeLine.length - 1];
+      ctx.save();
+      ctx.strokeStyle = isNight ? 'rgba(226, 232, 240, 0.14)' : 'rgba(68, 64, 60, 0.16)';
+      ctx.lineWidth = 1.0;
+      for (let i = 0; i < m.innerPoly.length; i += 3) {
+        const anchor = i < m.innerPoly.length * 0.33 ? rStart : i < m.innerPoly.length * 0.66 ? rMid : rEnd;
+        ctx.beginPath();
+        ctx.moveTo(anchor.x, anchor.y);
+        ctx.lineTo(m.innerPoly[i].x, m.innerPoly[i].y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // 5. Crisp geometric ridgeline spine
+    if (Array.isArray(m.ridgeLine) && m.ridgeLine.length >= 2) {
+      ctx.strokeStyle = pal.mountainRidge;
+      ctx.lineWidth = 2.4;
+      strokePolyline(ctx, m.ridgeLine);
+
+      // Summit diamond marker on central ridge peak
+      const crest = m.ridgeLine[Math.floor(m.ridgeLine.length / 2)];
+      ctx.fillStyle = pal.mountainRidge;
+      ctx.beginPath();
+      ctx.moveTo(crest.x, crest.y - 3.6);
+      ctx.lineTo(crest.x + 3.6, crest.y);
+      ctx.lineTo(crest.x, crest.y + 3.6);
+      ctx.lineTo(crest.x - 3.6, crest.y);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawLakes(ctx, lakes, fillStyle, useHalo = false) {
+  if (!lakes || lakes.length === 0) return;
+  ctx.save();
+  ctx.fillStyle = fillStyle;
+  for (const l of lakes) {
+    const poly = useHalo ? l.haloPoints || l.points : l.points;
+    fillPolygon(ctx, poly);
+  }
+  ctx.restore();
+}
+
+function drawRivers(ctx, rivers, strokeStyle, haloPad = 0) {
+  if (!rivers || rivers.length === 0) return;
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-
-  // Smooth bank halo
-  ctx.strokeStyle = pal.riverHalo;
-  ctx.lineWidth = river.halfWidth * 2 + 12;
-  strokePolyline(ctx, pts);
-
-  // Clean flat river ribbon
-  ctx.strokeStyle = pal.river;
-  ctx.lineWidth = river.halfWidth * 2;
-  strokePolyline(ctx, pts);
-
+  ctx.strokeStyle = strokeStyle;
+  for (const r of rivers) {
+    const pts = r?.points;
+    if (!pts || pts.length < 2) continue;
+    ctx.lineWidth = (r.halfWidth || 25) * 2 + haloPad;
+    strokePolyline(ctx, pts);
+  }
   ctx.restore();
 }
 
@@ -169,18 +279,64 @@ function drawCorridors(ctx, state, pal) {
       }
     }
 
-    // Hill-only tunnel portal sleeves
+    // Mountain & hill tunnel portal sleeves with crisp stone portal caps [ ]
+    const tunnelIntervals = [];
+    if (
+      (corridor.hasTunnel || corridor.hasMountainTunnel) &&
+      Array.isArray(corridor.mountainIntervals) &&
+      corridor.mountainIntervals.length > 0
+    ) {
+      tunnelIntervals.push(...corridor.mountainIntervals);
+    }
     if (corridor.hasTunnel && Array.isArray(corridor.hillIntervals) && corridor.hillIntervals.length > 0) {
-      for (const iv of corridor.hillIntervals) {
+      tunnelIntervals.push(...corridor.hillIntervals);
+    }
+
+    if (tunnelIntervals.length > 0) {
+      const portalColor = isNight ? '#CBD5E1' : '#3B3832';
+      const sleeveColor = isNight ? 'rgba(226, 232, 240, 0.26)' : 'rgba(59, 56, 50, 0.32)';
+      const hw = bundleWidth * 0.5 + 4.5;
+      const lip = 5.0;
+
+      for (const iv of tunnelIntervals) {
         const sub = extractSubPolyline(corridor.points, cumLengths, iv.start, iv.end);
         if (sub.length < 2) continue;
+
         ctx.save();
-        ctx.strokeStyle = isNight ? 'rgba(241, 245, 249, 0.24)' : 'rgba(35, 38, 41, 0.28)';
+        ctx.strokeStyle = sleeveColor;
         ctx.lineWidth = bundleWidth + 8;
         ctx.lineCap = 'butt';
         ctx.lineJoin = 'round';
         ctx.setLineDash([6, 5]);
         strokePolyline(ctx, sub);
+
+        // Stone portal caps [ ] at tunnel entrance and exit
+        ctx.setLineDash([]);
+        ctx.strokeStyle = portalColor;
+        ctx.lineWidth = 2.6;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        const pStart = samplePointAlongPolyline(corridor.points, cumLengths, iv.start);
+        const sNx = -pStart.ty;
+        const sNy = pStart.tx;
+        ctx.beginPath();
+        ctx.moveTo(pStart.x + sNx * hw + pStart.tx * lip, pStart.y + sNy * hw + pStart.ty * lip);
+        ctx.lineTo(pStart.x + sNx * hw, pStart.y + sNy * hw);
+        ctx.lineTo(pStart.x - sNx * hw, pStart.y - sNy * hw);
+        ctx.lineTo(pStart.x - sNx * hw + pStart.tx * lip, pStart.y - sNy * hw + pStart.ty * lip);
+        ctx.stroke();
+
+        const pEnd = samplePointAlongPolyline(corridor.points, cumLengths, iv.end);
+        const eNx = -pEnd.ty;
+        const eNy = pEnd.tx;
+        ctx.beginPath();
+        ctx.moveTo(pEnd.x + eNx * hw - pEnd.tx * lip, pEnd.y + eNy * hw - pEnd.ty * lip);
+        ctx.lineTo(pEnd.x + eNx * hw, pEnd.y + eNy * hw);
+        ctx.lineTo(pEnd.x - eNx * hw, pEnd.y - eNy * hw);
+        ctx.lineTo(pEnd.x - eNx * hw - pEnd.tx * lip, pEnd.y - eNy * hw - pEnd.ty * lip);
+        ctx.stroke();
+
         ctx.restore();
       }
     }
@@ -371,8 +527,10 @@ function drawOnboardingGuide(ctx, state, pal) {
   const citySt = state.stationById.get(ids.cityId);
   if (!resSt || !facSt || !citySt) return;
 
-  const leg1 = buildOctilinearPoints(resSt.x, resSt.y, facSt.x, facSt.y, state.river, state.hills);
-  const leg2 = buildOctilinearPoints(facSt.x, facSt.y, citySt.x, citySt.y, state.river, state.hills);
+  const water = { rivers: state.rivers, lakes: state.lakes, river: state.river };
+  const ctxOpts = { stations: state.stations, mountains: state.mountains };
+  const leg1 = buildOctilinearPoints(resSt.x, resSt.y, facSt.x, facSt.y, water, state.hills, ctxOpts);
+  const leg2 = buildOctilinearPoints(facSt.x, facSt.y, citySt.x, citySt.y, water, state.hills, ctxOpts);
   const combined = leg1.concat(leg2.slice(1));
   if (combined.length < 2) return;
 
@@ -451,12 +609,12 @@ function drawTokenIcon(ctx, tok, x, y, scale = 1, pal = null) {
   const kind = tok?.kind;
 
   if (kind === 'goods') {
-    // Plump rounded Parcel Box (13x12, rx=3)
+    // Plump rounded Parcel Box (13x12, rx=3) with Freight dark-steel frame pairing
     const w = 13;
     const h = 12;
     ctx.fillStyle = '#EAB308';
-    ctx.strokeStyle = theme.ink;
-    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = theme.freightFrame || theme.ink;
+    ctx.lineWidth = 2.1;
     ctx.beginPath();
     ctx.roundRect(-w / 2, -h / 2, w, h, 3);
     ctx.fill();
@@ -473,12 +631,12 @@ function drawTokenIcon(ctx, tok, x, y, scale = 1, pal = null) {
     ctx.lineTo(w / 2 - 2, 0);
     ctx.stroke();
   } else if (kind === 'raw') {
-    // Plump rounded Timber/Ingot Cylinder (14x10, rx=4.5)
+    // Plump rounded Timber/Ingot Cylinder (14x10, rx=4.5) with Freight dark-steel frame pairing
     const w = 14;
     const h = 10;
     ctx.fillStyle = '#C2410C';
-    ctx.strokeStyle = theme.ink;
-    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = theme.freightFrame || theme.ink;
+    ctx.lineWidth = 2.1;
     ctx.beginPath();
     ctx.roundRect(-w / 2, -h / 2, w, h, 4.5);
     ctx.fill();
@@ -629,7 +787,10 @@ function getStationSubtitle(st) {
 function drawHoverLabel(ctx, st, r, pal, isNight) {
   const title = st.name || '';
   if (!title) return;
-  const sub = getStationSubtitle(st);
+  let sub = getStationSubtitle(st);
+  if (st.needsFreightCue) {
+    sub = sub ? `${sub} · Needs Freight Train` : 'Needs Freight Train';
+  }
 
   ctx.save();
   ctx.font = 'bold 10.5px sans-serif';
@@ -840,6 +1001,43 @@ function drawStations(ctx, state, pal) {
       }
     }
 
+    // Subtle bobbing/pulsing mini Freight Hopper cue when station needs Freight service
+    if (st.needsFreightCue) {
+      const phase = state.fx?.cuePhase ?? (state.simTime || 0) * 3.0;
+      const bobY = Math.sin(phase) * 2.4;
+      const pulse = 1 + Math.cos(phase) * 0.05;
+      const bx = st.x;
+      const by = st.y - r - 17 + bobY;
+
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.scale(pulse, pulse);
+
+      // Badge backing pill
+      ctx.fillStyle = pal.stationFill;
+      ctx.strokeStyle = pal.freightFrame || pal.ink;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.roundRect(-12, -7.5, 24, 15, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      // Mini dark-framed Freight Hopper silhouette
+      ctx.fillStyle = pal.freightFrame || '#1E293B';
+      ctx.beginPath();
+      ctx.roundRect(-8.5, -4.5, 17, 9, 1.8);
+      ctx.fill();
+
+      // Amber side-girders + ribs
+      ctx.fillStyle = '#F59E0B';
+      ctx.fillRect(-7.5, -3.5, 15, 1.8);
+      ctx.fillRect(-7.5, 1.7, 15, 1.8);
+      ctx.fillStyle = pal.freightFrame || '#1E293B';
+      ctx.fillRect(-2.8, -4, 1.4, 8);
+      ctx.fillRect(1.4, -4, 1.4, 8);
+      ctx.restore();
+    }
+
     // Minimalist hover / high-zoom label
     if (isHovered || showAllLabels) {
       drawHoverLabel(ctx, st, r, pal, isNight);
@@ -851,39 +1049,43 @@ function drawExpressUnit(ctx, x, y, angle, lineColor, isLead, cargoSlice, hovere
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(angle);
-  const w = 22;
-  const h = 12;
+  const w = 25;
+  const h = 10.8;
 
   if (hovered) {
     ctx.strokeStyle = pal.ink;
     ctx.lineWidth = 3.6;
     ctx.beginPath();
-    ctx.roundRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4, 6);
+    ctx.roundRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4, 7.4);
     ctx.stroke();
   }
 
+  // Sleek 25x10.8 stadium pill (rx = 5.4) in lineColor
   ctx.fillStyle = lineColor;
   ctx.strokeStyle = pal.stationFill;
   ctx.lineWidth = 1.4;
   ctx.beginPath();
-  ctx.roundRect(-w / 2, -h / 2, w, h, 5);
+  ctx.roundRect(-w / 2, -h / 2, w, h, 5.4);
   ctx.fill();
   ctx.stroke();
 
   if (isLead) {
-    // Subtle nose notch on lead unit
-    ctx.fillStyle = pal.stationFill;
+    // Curved panoramic white windshield arc at the nose (+x)
+    ctx.fillStyle = '#FFFFFF';
     ctx.beginPath();
-    ctx.roundRect(w / 2 - 6.5, -3.5, 3.8, 7, 1.8);
+    ctx.moveTo(w / 2 - 6.2, -3.6);
+    ctx.quadraticCurveTo(w / 2 - 0.8, 0, w / 2 - 6.2, 3.6);
+    ctx.quadraticCurveTo(w / 2 - 3.6, 0, w / 2 - 6.2, -3.6);
+    ctx.closePath();
     ctx.fill();
   } else {
-    // Up to 3 clean high-contrast circular passenger pips inside trailing car
-    const pipXs = [-6, 0, 6];
+    // 3 crisp circular passenger windows
+    const pipXs = [-6.5, 0, 6.5];
     for (let i = 0; i < 3; i++) {
       const occupied = i < cargoSlice.length;
       ctx.beginPath();
-      ctx.arc(pipXs[i], 0, 2.3, 0, Math.PI * 2);
-      ctx.fillStyle = occupied ? '#FFFFFF' : 'rgba(255, 255, 255, 0.25)';
+      ctx.arc(pipXs[i], 0, 2.2, 0, Math.PI * 2);
+      ctx.fillStyle = occupied ? '#FFFFFF' : 'rgba(255, 255, 255, 0.28)';
       ctx.fill();
     }
   }
@@ -894,44 +1096,69 @@ function drawFreightUnit(ctx, x, y, angle, lineColor, isLead, cargoSlice, hovere
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(angle);
-  const w = 22;
-  const h = 13;
+  const w = 21;
+  const h = 14.2;
+  const frameColor = pal.freightFrame || '#1E293B';
 
   if (hovered) {
     ctx.strokeStyle = pal.ink;
     ctx.lineWidth = 3.6;
     ctx.beginPath();
-    ctx.roundRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4, 5);
+    ctx.roundRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4, 3.6);
     ctx.stroke();
   }
 
-  // Flat-bed rounded car in lineColor
-  ctx.fillStyle = lineColor;
+  // Bold dark-steel structural chassis (21x14.2, rx = 2.2)
+  ctx.fillStyle = frameColor;
   ctx.strokeStyle = pal.stationFill;
-  ctx.lineWidth = 1.4;
+  ctx.lineWidth = 1.1;
   ctx.beginPath();
-  ctx.roundRect(-w / 2, -h / 2, w, h, 3.5);
+  ctx.roundRect(-w / 2, -h / 2, w, h, 2.2);
   ctx.fill();
   ctx.stroke();
 
+  // Thick lineColor side-girders along both flanks
+  ctx.fillStyle = lineColor;
+  ctx.fillRect(-w / 2 + 1.4, -h / 2 + 1.1, w - 2.8, 2.5);
+  ctx.fillRect(-w / 2 + 1.4, h / 2 - 3.6, w - 2.8, 2.5);
+
   if (isLead) {
-    // Clean geometric cab visor on lead unit
-    ctx.fillStyle = pal.ink;
+    // Twin-hood industrial diesel cab + nose chevrons
+    ctx.fillStyle = lineColor;
     ctx.beginPath();
-    ctx.roundRect(w / 2 - 8, -4.5, 5.5, 9, 2);
-    ctx.fill();
-  } else {
-    // Dark recessed cargo well showing miniature chubby raw/goods icons
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.45)';
-    ctx.beginPath();
-    ctx.roundRect(-w / 2 + 2.2, -h / 2 + 2.2, w - 4.4, h - 4.4, 2);
+    ctx.roundRect(-w / 2 + 2.2, -4.0, 9.5, 8.0, 1.4);
     ctx.fill();
 
-    const slotXs = [-5.8, 0, 5.8];
+    // Cab roof / windshield visor
+    ctx.fillStyle = '#F8FAFC';
+    ctx.fillRect(-w / 2 + 8.8, -3.1, 2.2, 6.2);
+
+    // Nose chevron stripes at +x
+    ctx.strokeStyle = '#FACC15';
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(w / 2 - 5.2, -3.4);
+    ctx.lineTo(w / 2 - 2.6, 0);
+    ctx.lineTo(w / 2 - 5.2, 3.4);
+    ctx.stroke();
+  } else {
+    // 3 recessed cargo compartments separated by 2 dark cross-ribs
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
+    ctx.beginPath();
+    ctx.roundRect(-w / 2 + 2.0, -h / 2 + 3.6, w - 4.0, h - 7.2, 1.2);
+    ctx.fill();
+
+    // 2 dark cross-ribs dividing the 3 cargo bays
+    ctx.fillStyle = frameColor;
+    ctx.fillRect(-3.4, -h / 2 + 3.4, 1.6, h - 6.8);
+    ctx.fillRect(1.8, -h / 2 + 3.4, 1.6, h - 6.8);
+
+    const slotXs = [-5.5, 0, 5.5];
     for (let i = 0; i < 3; i++) {
       const tok = cargoSlice[i];
       if (tok) {
-        drawTokenIcon(ctx, tok, slotXs[i], 0, 0.38, pal);
+        drawTokenIcon(ctx, tok, slotXs[i], 0, 0.36, pal);
       }
     }
   }
@@ -1070,9 +1297,28 @@ function drawFX(ctx, state, pal) {
   }
 }
 
+function drawDragPill(ctx, x, y, text, bgColor, textColor) {
+  const w = Math.max(72, text.length * 7 + 16);
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 0.95;
+  ctx.fillStyle = bgColor;
+  ctx.beginPath();
+  ctx.roundRect(x - w / 2, y - 11, w, 22, 11);
+  ctx.fill();
+  ctx.fillStyle = textColor;
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, y + 0.5);
+  ctx.restore();
+}
+
 function drawDragPreview(ctx, state, pal) {
   const drag = state.interaction.drag;
   if (!drag) return;
+
+  const water = { rivers: state.rivers, lakes: state.lakes, river: state.river };
 
   if (state.interaction.mode === 'buildLine' || state.interaction.mode === 'insertNode') {
     const line = state.lines[drag.lineId];
@@ -1084,13 +1330,19 @@ function drawDragPreview(ctx, state, pal) {
     const tx = targetSt ? targetSt.x : drag.worldX;
     const ty = targetSt ? targetSt.y : drag.worldY;
 
-    const pts = buildOctilinearPoints(fromSt.x, fromSt.y, tx, ty, state.river, state.hills, {
+    const pts = buildOctilinearPoints(fromSt.x, fromSt.y, tx, ty, water, state.hills, {
       stations: state.stations,
+      mountains: state.mountains,
     });
-    const crossings = countRiverCrossings(pts, state.river);
+    const crossings = countRiverCrossings(pts, water);
+    const mCrossings = countMountainCrossings(pts, state.mountains);
     const existing = targetSt ? state.corridors.get(edgeKey(fromSt.id, targetSt.id)) : null;
+
     const needsBridge = crossings > 0 && !(existing && existing.hasBridge);
-    const blocked = needsBridge && state.inventory.bridge <= 0;
+    const needsTunnel = mCrossings > 0 && !(existing && existing.hasMountainTunnel);
+    const blockedBridge = needsBridge && state.inventory.bridge <= 0;
+    const blockedTunnel = needsTunnel && state.inventory.tunnel <= 0;
+    const blocked = blockedBridge || blockedTunnel;
 
     ctx.save();
     ctx.strokeStyle = blocked ? pal.danger : lineColor;
@@ -1100,20 +1352,113 @@ function drawDragPreview(ctx, state, pal) {
     ctx.globalAlpha = 0.72;
     ctx.setLineDash(blocked ? [6, 6] : [10, 6]);
     strokePolyline(ctx, pts);
+    ctx.restore();
 
-    if (needsBridge) {
+    if (needsBridge && needsTunnel) {
+      const p1 = pts[Math.max(0, Math.floor(pts.length / 3))];
+      const p2 = pts[Math.min(pts.length - 1, Math.floor((pts.length * 2) / 3))];
+      drawDragPill(
+        ctx,
+        p1.x,
+        p1.y - 12,
+        blockedBridge ? 'NO BRIDGE' : 'BRIDGE -1',
+        blockedBridge ? pal.danger : pal.ink,
+        pal.stationFill
+      );
+      drawDragPill(
+        ctx,
+        p2.x,
+        p2.y + 12,
+        blockedTunnel ? 'NO TUNNEL' : 'TUNNEL -1',
+        blockedTunnel ? pal.danger : pal.ink,
+        pal.stationFill
+      );
+    } else if (needsBridge) {
       const mid = pts[Math.floor(pts.length / 2)];
-      ctx.setLineDash([]);
-      ctx.globalAlpha = 0.95;
-      ctx.fillStyle = blocked ? pal.danger : pal.ink;
-      ctx.beginPath();
-      ctx.roundRect(mid.x - 36, mid.y - 11, 72, 22, 11);
-      ctx.fill();
-      ctx.fillStyle = pal.stationFill;
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(blocked ? 'NO BRIDGE' : 'BRIDGE -1', mid.x, mid.y + 0.5);
+      drawDragPill(
+        ctx,
+        mid.x,
+        mid.y,
+        blockedBridge ? 'NO BRIDGE' : 'BRIDGE -1',
+        blockedBridge ? pal.danger : pal.ink,
+        pal.stationFill
+      );
+    } else if (needsTunnel) {
+      const mid = pts[Math.floor(pts.length / 2)];
+      drawDragPill(
+        ctx,
+        mid.x,
+        mid.y,
+        blockedTunnel ? 'NO TUNNEL' : 'TUNNEL -1',
+        blockedTunnel ? pal.danger : pal.ink,
+        pal.stationFill
+      );
+    }
+  } else if (state.interaction.mode === 'detachStation') {
+    const line = state.lines[drag.lineId];
+    if (!line) return;
+    const lineColor = getLineColor(state, line.id);
+    const prevSt = drag.prevId != null ? state.stationById.get(drag.prevId) : null;
+    const nextSt = drag.nextId != null ? state.stationById.get(drag.nextId) : null;
+    const snapSt =
+      drag.snapStationId && drag.snapStationId !== drag.stationId
+        ? state.stationById.get(drag.snapStationId)
+        : null;
+    const ctxOpts = { stations: state.stations, mountains: state.mountains };
+
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (snapSt) {
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 4.6;
+      ctx.globalAlpha = 0.78;
+      ctx.setLineDash([10, 6]);
+      if (prevSt) {
+        const pts1 = buildOctilinearPoints(prevSt.x, prevSt.y, snapSt.x, snapSt.y, water, state.hills, ctxOpts);
+        strokePolyline(ctx, pts1);
+      }
+      if (nextSt) {
+        const pts2 = buildOctilinearPoints(snapSt.x, snapSt.y, nextSt.x, nextSt.y, water, state.hills, ctxOpts);
+        strokePolyline(ctx, pts2);
+      }
+    } else if (drag.detached) {
+      // Subtle elastic tether from pulled-out cursor to neighbors
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 2.4;
+      ctx.globalAlpha = 0.3;
+      ctx.setLineDash([5, 5]);
+      if (prevSt) {
+        ctx.beginPath();
+        ctx.moveTo(prevSt.x, prevSt.y);
+        ctx.lineTo(drag.worldX, drag.worldY);
+        ctx.stroke();
+      }
+      if (nextSt) {
+        ctx.beginPath();
+        ctx.moveTo(drag.worldX, drag.worldY);
+        ctx.lineTo(nextSt.x, nextSt.y);
+        ctx.stroke();
+      }
+
+      // Live bypassed prevSt <-> nextSt preview
+      if (prevSt && nextSt) {
+        const bypassPts = buildOctilinearPoints(
+          prevSt.x,
+          prevSt.y,
+          nextSt.x,
+          nextSt.y,
+          water,
+          state.hills,
+          ctxOpts
+        );
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 4.6;
+        ctx.globalAlpha = 0.82;
+        ctx.setLineDash([10, 6]);
+        strokePolyline(ctx, bypassPts);
+      }
     }
     ctx.restore();
   } else if (
@@ -1132,7 +1477,7 @@ function drawDragPreview(ctx, state, pal) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const labelMap = {
-      express: 'EXP',
+      express: 'PAX',
       freight: 'FRT',
       car: '+CAR',
       doubleTrack: '2×',
@@ -1146,6 +1491,7 @@ function drawDragPreview(ctx, state, pal) {
 
 export function renderGame(ctx, state) {
   const pal = getThemePalette(state);
+  const isNight = state.theme === 'night';
   const { width, height, dpr } = state.viewport;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
@@ -1160,7 +1506,19 @@ export function renderGame(ctx, state) {
   ctx.translate(-state.camera.x, -state.camera.y);
 
   drawHills(ctx, state.hills, pal);
-  drawRiver(ctx, state, pal);
+  drawMountains(ctx, state.mountains, pal, isNight);
+
+  const rivers = state.rivers?.length
+    ? state.rivers
+    : state.river?.points?.length
+    ? [state.river]
+    : [];
+  // Two-pass water rendering so river confluences & lake mouths merge seamlessly
+  drawLakes(ctx, state.lakes, pal.riverHalo, true);
+  drawRivers(ctx, rivers, pal.riverHalo, 12);
+  drawLakes(ctx, state.lakes, pal.river, false);
+  drawRivers(ctx, rivers, pal.river, 0);
+
   drawOnboardingGuide(ctx, state, pal);
   drawCorridors(ctx, state, pal);
   drawTBars(ctx, state, pal);

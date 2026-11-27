@@ -30,8 +30,9 @@ export const CONFIG = {
   DAY_SECONDS: 10.5,
   DAYS_PER_WEEK: 7,
   DAY_NAMES: ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'],
-  OVERFLOW_DURATION: 30.0,
-  OVERFLOW_DRAIN_RATE: 0.75,
+  INITIAL_SPAWN_INTERVAL: 34.0,
+  OVERFLOW_DURATION: 42.0,
+  OVERFLOW_DRAIN_RATE: 1.25,
 
   EXPRESS_SPEED: 155,
   FREIGHT_SPEED: 100,
@@ -46,6 +47,10 @@ export const CONFIG = {
   CAR_CAPACITY: 3,
   CAR_SPACING: 23,
   BOGIE_WHEELBASE: 13,
+  PASSENGER_UNIT_LEN: 25,
+  FREIGHT_UNIT_LEN: 21,
+  HEADWAY_BUFFER: 22,
+  PLATFORM_PASS_OFFSET: 5.0,
   // Legacy capacity constants preserved for intermediate module compatibility
   TRAIN_BASE_CAPACITY: 0,
   CAR_CAPACITY_BONUS: 3,
@@ -77,12 +82,20 @@ export const CONFIG = {
     ['Fairview', 'FV'],
     ['Clearwater', 'CW'],
     ['Highgate', 'HG'],
+    ['Alderney', 'AL'],
+    ['Bramwell', 'BW'],
+    ['Crestview', 'CV'],
+    ['Dunmore', 'DM'],
+    ['Elmhurst', 'EH'],
+    ['Fernwood', 'FW'],
+    ['Glenhollow', 'GL'],
+    ['Kingsford', 'KF'],
   ],
 
   INDUSTRY_NAMES: {
-    forest: ['Timber Camp', 'Pine Logging', 'Cedar Woods', 'Redwood Mill'],
-    mine: ['Iron Ridge', 'Coal Hollow', 'Copper Quarry', 'Granite Pit'],
-    factory: ['Millworks', 'Valley Foundry', 'Steam Joinery', 'Ironworks'],
+    forest: ['Timber Camp', 'Pine Logging', 'Cedar Woods', 'Redwood Mill', 'Birchwood', 'Larch Grove'],
+    mine: ['Iron Ridge', 'Coal Hollow', 'Copper Quarry', 'Granite Pit', 'Slate Vein', 'Oakhill Ore'],
+    factory: ['Millworks', 'Valley Foundry', 'Steam Joinery', 'Ironworks', 'Brick Kiln', 'Steel Forge'],
   },
 
   MIN_HEADWAY: 52,
@@ -113,6 +126,11 @@ export const THEMES = {
     riverHalo: '#DFEAF0',
     hillFill: 'rgba(175, 163, 140, 0.14)',
     hillStroke: 'rgba(140, 128, 108, 0.28)',
+    mountainOuter: 'rgba(120, 113, 108, 0.22)',
+    mountainInner: 'rgba(100, 94, 88, 0.32)',
+    mountainPeak: 'rgba(87, 83, 78, 0.44)',
+    mountainRidge: 'rgba(68, 64, 60, 0.62)',
+    freightFrame: '#1E293B',
     ink: '#232629',
     stationFill: '#FFFDF9',
     muted: '#6E6A61',
@@ -128,6 +146,11 @@ export const THEMES = {
     riverHalo: '#1D2430',
     hillFill: 'rgba(255, 255, 255, 0.035)',
     hillStroke: 'rgba(255, 255, 255, 0.10)',
+    mountainOuter: 'rgba(148, 163, 184, 0.08)',
+    mountainInner: 'rgba(148, 163, 184, 0.14)',
+    mountainPeak: 'rgba(203, 213, 225, 0.20)',
+    mountainRidge: 'rgba(226, 232, 240, 0.38)',
+    freightFrame: '#0F172A',
     ink: '#F1F5F9',
     stationFill: '#1E2430',
     muted: '#94A3B8',
@@ -192,6 +215,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     speed: 1, // 0, 1, 2
     savedSpeedBeforeModal: 1,
     phase: 'playing', // 'playing' | 'draft' | 'gameover'
+    endlessMode: false,
     gameOverReason: '',
     muted: false,
 
@@ -215,8 +239,12 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     },
 
     // Terrain
+    mapArchetype: 'confluence', // 'confluence' | 'mountainPass' | 'lakeBay' | 'gorge'
     river: { points: [], halfWidth: 26 },
-    hills: [], // [{ id, x, y, rx, ry, angle, rings }]
+    rivers: [], // Array<{ points, halfWidth }>
+    lakes: [], // Array<{ id, x, y, rx, ry, points, haloPoints }>
+    mountains: [], // Array<{ id, x, y, rx, ry, angle, outerPoly, innerPoly, peakPoly, ridgeLine }>
+    hills: [], // Array<{ id, x, y, rx, ry, angle, ringsPoly }>
 
     // Graph & Network
     stations: [],
@@ -224,7 +252,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
     pendingSpawns: [], // pre-generated future station schedule
     nextSpawnIndex: 0,
     spawnElapsed: 0,
-    nextSpawnInterval: 18,
+    nextSpawnInterval: CONFIG.INITIAL_SPAWN_INTERVAL,
     nextTokenId: 1,
 
     corridors: new Map(), // edgeKey -> corridor object
@@ -243,7 +271,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
       car: 1,
       bridge: 2,
       doubleTrack: 1,
-      tunnel: 1,
+      tunnel: 2,
       interchange: 0,
     },
 
@@ -258,7 +286,7 @@ export function createInitialState(seed = Math.floor(Math.random() * 0xffffffff)
 
     // Interactive State (used by input.js & renderer.js)
     interaction: {
-      mode: 'idle', // 'idle' | 'buildLine' | 'insertNode' | 'dragToken' | 'dragTrain' | 'dragUpgrade' | 'pan'
+      mode: 'idle', // 'idle' | 'buildLine' | 'detachStation' | 'insertNode' | 'dragToken' | 'dragTrain' | 'dragUpgrade' | 'pan'
       selectedTool: null, // optional click-to-place tool from dock
       hoveredStationId: null,
       hoveredCorridorKey: null,

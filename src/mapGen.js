@@ -28,8 +28,38 @@ export function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
   );
 }
 
-export function distanceToRiver(river, px, py) {
-  const pts = river.points;
+export function isPointInPolygon(poly, px, py) {
+  if (!Array.isArray(poly) || poly.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x;
+    const yi = poly[i].y;
+    const xj = poly[j].x;
+    const yj = poly[j].y;
+    const denom = yj - yi;
+    const intersect =
+      (yi > py) !== (yj > py) &&
+      px < ((xj - xi) * (py - yi)) / (denom === 0 ? 1e-12 : denom) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function distanceToPolyBoundary(poly, px, py) {
+  if (!Array.isArray(poly) || poly.length < 2) return Infinity;
+  let minSq = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const dSq = pointToSegmentDistSq(px, py, a.x, a.y, b.x, b.y);
+    if (dSq < minSq) minSq = dSq;
+  }
+  return Math.sqrt(minSq);
+}
+
+function distanceToSingleRiver(river, px, py) {
+  const pts = river?.points;
+  if (!Array.isArray(pts) || pts.length < 2) return Infinity;
   let minSq = Infinity;
   for (let i = 0; i < pts.length - 1; i++) {
     const dSq = pointToSegmentDistSq(px, py, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
@@ -38,23 +68,133 @@ export function distanceToRiver(river, px, py) {
   return Math.sqrt(minSq);
 }
 
-export function countRiverCrossings(points, river) {
-  const rPts = river.points;
+function normalizeWater(water) {
+  if (!water) return { rivers: [], lakes: [] };
+  if (Array.isArray(water)) return { rivers: water, lakes: [] };
+  if (Array.isArray(water.rivers) || Array.isArray(water.lakes)) {
+    const rivers =
+      Array.isArray(water.rivers) && water.rivers.length > 0
+        ? water.rivers
+        : water.river?.points?.length
+          ? [water.river]
+          : [];
+    const lakes = Array.isArray(water.lakes) ? water.lakes : [];
+    return { rivers, lakes };
+  }
+  if (Array.isArray(water.points)) {
+    return { rivers: [water], lakes: [] };
+  }
+  return { rivers: [], lakes: [] };
+}
+
+export function distanceToRiver(water, px, py) {
+  const { rivers, lakes } = normalizeWater(water);
+  let minDist = Infinity;
+  for (const r of rivers) {
+    const d = distanceToSingleRiver(r, px, py);
+    if (d < minDist) minDist = d;
+  }
+  for (const l of lakes) {
+    if (!Array.isArray(l?.points) || l.points.length < 3) continue;
+    if (isPointInPolygon(l.points, px, py)) return 0;
+    const d = distanceToPolyBoundary(l.points, px, py);
+    if (d < minDist) minDist = d;
+  }
+  return minDist;
+}
+
+export function countRiverCrossings(points, water) {
+  if (!Array.isArray(points) || points.length < 2) return 0;
+  const { rivers, lakes } = normalizeWater(water);
   let crossings = 0;
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i];
-    const b = points[i + 1];
-    for (let j = 0; j < rPts.length - 1; j++) {
-      if (segmentsIntersect(a.x, a.y, b.x, b.y, rPts[j].x, rPts[j].y, rPts[j + 1].x, rPts[j + 1].y)) {
-        crossings++;
+
+  for (const r of rivers) {
+    const rPts = r?.points;
+    if (!Array.isArray(rPts) || rPts.length < 2) continue;
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      for (let j = 0; j < rPts.length - 1; j++) {
+        if (
+          segmentsIntersect(a.x, a.y, b.x, b.y, rPts[j].x, rPts[j].y, rPts[j + 1].x, rPts[j + 1].y)
+        ) {
+          crossings++;
+        }
       }
     }
+  }
+
+  for (const l of lakes) {
+    const poly = l?.points;
+    if (!Array.isArray(poly) || poly.length < 3) continue;
+    let lakeHit = 0;
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      for (let j = 0; j < poly.length; j++) {
+        const p1 = poly[j];
+        const p2 = poly[(j + 1) % poly.length];
+        if (segmentsIntersect(a.x, a.y, b.x, b.y, p1.x, p1.y, p2.x, p2.y)) {
+          lakeHit++;
+        }
+      }
+    }
+    if (lakeHit === 0) {
+      const mid = points[Math.floor(points.length / 2)];
+      if (isPointInPolygon(poly, mid.x, mid.y)) lakeHit = 1;
+    }
+    crossings += lakeHit;
+  }
+
+  return crossings;
+}
+
+export function isPointInMountain(mountains, px, py) {
+  if (!Array.isArray(mountains)) return false;
+  for (const m of mountains) {
+    if (m?.outerPoly && isPointInPolygon(m.outerPoly, px, py)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function countMountainCrossings(points, mountains) {
+  if (!Array.isArray(points) || points.length < 2 || !Array.isArray(mountains) || mountains.length === 0) {
+    return 0;
+  }
+  let crossings = 0;
+  for (const m of mountains) {
+    const poly = m?.outerPoly;
+    if (!Array.isArray(poly) || poly.length < 3) continue;
+    let hit = 0;
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      for (let j = 0; j < poly.length; j++) {
+        const p1 = poly[j];
+        const p2 = poly[(j + 1) % poly.length];
+        if (segmentsIntersect(a.x, a.y, b.x, b.y, p1.x, p1.y, p2.x, p2.y)) {
+          hit++;
+        }
+      }
+    }
+    if (hit === 0) {
+      const mid = points[Math.floor(points.length / 2)];
+      if (isPointInPolygon(poly, mid.x, mid.y)) hit = 1;
+    }
+    crossings += hit;
   }
   return crossings;
 }
 
 export function isPointInHill(hills, px, py) {
+  if (!Array.isArray(hills)) return false;
   for (const h of hills) {
+    if (Array.isArray(h?.ringsPoly) && Array.isArray(h.ringsPoly[0]) && h.ringsPoly[0].length >= 3) {
+      if (isPointInPolygon(h.ringsPoly[0], px, py)) return true;
+      continue;
+    }
     const dx = px - h.x;
     const dy = py - h.y;
     const cos = Math.cos(-h.angle);
@@ -136,13 +276,54 @@ export function computeHillIntervals(points, cumLengths, totalLength, hills) {
   return intervals;
 }
 
-export function computeRiverIntervals(points, cumLengths, totalLength, river) {
-  if (!river?.points?.length || !points || points.length < 2) return [];
+export function computeMountainIntervals(points, cumLengths, totalLength, mountains) {
+  if (!Array.isArray(mountains) || mountains.length === 0 || !points || points.length < 2) {
+    return [];
+  }
   const minS = CONFIG.STATION_RADIUS + 2;
   const maxS = totalLength - (CONFIG.STATION_RADIUS + 2);
   if (maxS <= minS) return [];
 
-  const threshold = (river.halfWidth || 25) + 9;
+  const step = 4;
+  const raw = [];
+  let inMtn = false;
+  let startS = minS;
+
+  for (let s = minS; s <= maxS; s += step) {
+    const pt = samplePointAlongPolyline(points, cumLengths, s);
+    const inside = isPointInMountain(mountains, pt.x, pt.y);
+    if (inside && !inMtn) {
+      inMtn = true;
+      startS = s;
+    } else if (!inside && inMtn) {
+      inMtn = false;
+      raw.push({ start: Math.max(minS, startS), end: Math.min(maxS, s) });
+    }
+  }
+  if (inMtn) {
+    raw.push({ start: Math.max(minS, startS), end: maxS });
+  }
+
+  const merged = [];
+  for (const iv of raw) {
+    if (iv.end - iv.start < 2) continue;
+    const prev = merged[merged.length - 1];
+    if (prev && iv.start - prev.end < 8) {
+      prev.end = iv.end;
+    } else {
+      merged.push({ start: iv.start, end: iv.end });
+    }
+  }
+  return merged;
+}
+
+export function computeRiverIntervals(points, cumLengths, totalLength, water) {
+  const { rivers, lakes } = normalizeWater(water);
+  if ((rivers.length === 0 && lakes.length === 0) || !points || points.length < 2) return [];
+  const minS = CONFIG.STATION_RADIUS + 2;
+  const maxS = totalLength - (CONFIG.STATION_RADIUS + 2);
+  if (maxS <= minS) return [];
+
   const step = 4;
   const raw = [];
   let inWater = false;
@@ -150,7 +331,24 @@ export function computeRiverIntervals(points, cumLengths, totalLength, river) {
 
   for (let s = minS; s <= maxS; s += step) {
     const pt = samplePointAlongPolyline(points, cumLengths, s);
-    const overWater = distanceToRiver(river, pt.x, pt.y) <= threshold;
+    let overWater = false;
+    for (const r of rivers) {
+      if (!r?.points?.length) continue;
+      const threshold = (r.halfWidth || 25) + 9;
+      if (distanceToSingleRiver(r, pt.x, pt.y) <= threshold) {
+        overWater = true;
+        break;
+      }
+    }
+    if (!overWater) {
+      for (const l of lakes) {
+        if (!Array.isArray(l?.points) || l.points.length < 3) continue;
+        if (isPointInPolygon(l.points, pt.x, pt.y) || distanceToPolyBoundary(l.points, pt.x, pt.y) <= 4) {
+          overWater = true;
+          break;
+        }
+      }
+    }
     if (overWater && !inWater) {
       inWater = true;
       startS = s;
@@ -232,7 +430,7 @@ function angleDiffRad(a, b) {
   return d > Math.PI ? Math.PI * 2 - d : d;
 }
 
-export function buildOctilinearPoints(ax, ay, bx, by, river, hills, context = null) {
+export function buildOctilinearPoints(ax, ay, bx, by, water, hills, context = null) {
   const dx = bx - ax;
   const dy = by - ay;
   const absX = Math.abs(dx);
@@ -254,13 +452,15 @@ export function buildOctilinearPoints(ax, ay, bx, by, river, hills, context = nu
 
   const clearanceSq = (CONFIG.STATION_RADIUS + 14) * (CONFIG.STATION_RADIUS + 14);
   const portSpreadRad = (22 * Math.PI) / 180;
+  const mountains = context?.mountains || [];
 
   const scoreCandidate = (pts) => {
-    const cross = countRiverCrossings(pts, river);
+    const cross = countRiverCrossings(pts, water);
+    const mCross = countMountainCrossings(pts, mountains);
     const { cumLengths, totalLength } = computePolylineLengths(pts);
     const intervals = computeHillIntervals(pts, cumLengths, totalLength, hills);
     const hillLen = intervals.reduce((acc, iv) => acc + (iv.end - iv.start), 0);
-    let score = cross * 10000 + hillLen;
+    let score = cross * 10000 + mCross * 9500 + hillLen * 1.0;
 
     if (context) {
       if (Array.isArray(context.stations)) {
@@ -335,25 +535,8 @@ export function buildOctilinearPoints(ax, ay, bx, by, river, hills, context = nu
   return scoreCandidate(cand1) <= scoreCandidate(cand2) ? cand1 : cand2;
 }
 
-function generateRiver(rng) {
-  // Meandering river running roughly left-to-right with gentle valley curves
-  const control = [];
-  const xStart = -1350;
-  const xEnd = 1350;
-  const segments = 9;
-  const baseTilt = (rng() - 0.5) * 260;
-
-  for (let i = 0; i <= segments; i++) {
-    const t = i / segments;
-    const x = xStart + (xEnd - xStart) * t;
-    const wave = Math.sin(t * Math.PI * 2.2 + rng() * 1.4) * (95 + rng() * 55);
-    const y = baseTilt * (t - 0.5) + wave + (rng() - 0.5) * 45;
-    control.push({ x, y });
-  }
-
-  // Catmull-Rom interpolation
+function catmullRomSpline(control, stepsPerSeg = 14) {
   const points = [];
-  const stepsPerSeg = 14;
   for (let i = 0; i < control.length - 1; i++) {
     const p0 = control[Math.max(0, i - 1)];
     const p1 = control[i];
@@ -379,45 +562,286 @@ function generateRiver(rng) {
     }
   }
   points.push(control[control.length - 1]);
-  return { points, halfWidth: 25 };
+  return points;
 }
 
-function generateHills(rng, river) {
+function generateRiver(rng, opts = {}) {
+  const control = [];
+  const xStart = opts.xStart ?? -1350;
+  const xEnd = opts.xEnd ?? 1350;
+  const segments = opts.segments ?? 9;
+  const baseTilt = opts.baseTilt ?? (rng() - 0.5) * 260;
+  const amp = opts.amp ?? (95 + rng() * 55);
+  const yOffset = opts.yOffset ?? 0;
+  const freq = opts.freq ?? 2.2;
+  const phase = rng() * Math.PI * 2;
+
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const x = xStart + (xEnd - xStart) * t;
+    const wave = Math.sin(t * Math.PI * freq + phase) * amp;
+    const y = yOffset + baseTilt * (t - 0.5) + wave + (rng() - 0.5) * 40;
+    control.push({ x, y });
+  }
+
+  return { points: catmullRomSpline(control, 14), halfWidth: opts.halfWidth ?? 25 };
+}
+
+function generateTributaryRiver(rng, mainRiver, fromTop = true) {
+  const joinIdx = Math.floor(mainRiver.points.length * (0.42 + rng() * 0.2));
+  const joinPt = mainRiver.points[Math.max(0, Math.min(mainRiver.points.length - 1, joinIdx))];
+  const sign = fromTop ? -1 : 1;
+  const startX = joinPt.x - (360 + rng() * 340);
+  const startY = sign * (720 + rng() * 140);
+
+  const control = [];
+  const steps = 5;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const x = startX + (joinPt.x - startX) * t + Math.sin(t * Math.PI * 1.5) * (rng() - 0.5) * 90;
+    const y = startY + (joinPt.y - startY) * t + Math.cos(t * Math.PI) * 35 * sign;
+    control.push({ x, y });
+  }
+  return { points: catmullRomSpline(control, 12), halfWidth: 20 };
+}
+
+function createLake(id, x, y, rx, ry, rng) {
+  const verts = 28;
+  const p1 = rng() * Math.PI * 2;
+  const p2 = rng() * Math.PI * 2;
+  const rot = (rng() - 0.5) * 0.8;
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  const points = [];
+  const haloPoints = [];
+
+  for (let i = 0; i < verts; i++) {
+    const theta = (i / verts) * Math.PI * 2;
+    const lobe = 1 + 0.16 * Math.sin(2 * theta + p1) + 0.10 * Math.cos(3 * theta + p2);
+    const lx = Math.cos(theta) * rx * lobe;
+    const ly = Math.sin(theta) * ry * lobe;
+    const wx = x + lx * cos - ly * sin;
+    const wy = y + lx * sin + ly * cos;
+    points.push({ x: wx, y: wy });
+
+    const hlx = Math.cos(theta) * (rx * lobe + 14);
+    const hly = Math.sin(theta) * (ry * lobe + 14);
+    haloPoints.push({
+      x: x + hlx * cos - hly * sin,
+      y: y + hlx * sin + hly * cos,
+    });
+  }
+
+  return { id, x, y, rx, ry, points, haloPoints };
+}
+
+function createMountainMassif(id, x, y, rx, ry, angle, rng) {
+  const verts = 11 + Math.floor(rng() * 4);
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const outerPoly = [];
+  const innerPoly = [];
+  const peakPoly = [];
+
+  const peakOffX = (rng() - 0.5) * rx * 0.18;
+  const peakOffY = (rng() - 0.5) * ry * 0.18;
+
+  for (let i = 0; i < verts; i++) {
+    const theta = (i / verts) * Math.PI * 2;
+    const facet = 0.82 + rng() * 0.34;
+    const lx = Math.cos(theta) * rx * facet;
+    const ly = Math.sin(theta) * ry * facet;
+    outerPoly.push({
+      x: x + lx * cos - ly * sin,
+      y: y + lx * sin + ly * cos,
+    });
+
+    const inFacet = facet * (0.58 + rng() * 0.10);
+    const ilx = Math.cos(theta) * rx * inFacet + peakOffX * 0.5;
+    const ily = Math.sin(theta) * ry * inFacet + peakOffY * 0.5;
+    innerPoly.push({
+      x: x + ilx * cos - ily * sin,
+      y: y + ilx * sin + ily * cos,
+    });
+
+    const pkFacet = facet * (0.28 + rng() * 0.08);
+    const plx = Math.cos(theta) * rx * pkFacet + peakOffX;
+    const ply = Math.sin(theta) * ry * pkFacet + peakOffY;
+    peakPoly.push({
+      x: x + plx * cos - ply * sin,
+      y: y + plx * sin + ply * cos,
+    });
+  }
+
+  const ridgeSteps = 5;
+  const ridgeLine = [];
+  for (let i = 0; i < ridgeSteps; i++) {
+    const t = i / (ridgeSteps - 1) - 0.5;
+    const rlx = t * rx * 1.35 + peakOffX * (1 - Math.abs(t));
+    const rly = (i % 2 === 0 ? -1 : 1) * ry * 0.14 * (1 - Math.abs(t)) + peakOffY * 0.6;
+    ridgeLine.push({
+      x: x + rlx * cos - rly * sin,
+      y: y + rlx * sin + rly * cos,
+    });
+  }
+
+  return { id, x, y, rx, ry, angle, outerPoly, innerPoly, peakPoly, ridgeLine };
+}
+
+function createOrganicHill(id, x, y, rx, ry, angle, rng) {
+  const verts = 26;
+  const p1 = rng() * Math.PI * 2;
+  const p2 = rng() * Math.PI * 2;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const scales = [1.0, 0.70, 0.42];
+  const ringsPoly = scales.map((sc, rIdx) => {
+    const ring = [];
+    for (let i = 0; i < verts; i++) {
+      const theta = (i / verts) * Math.PI * 2;
+      const lobe =
+        1 +
+        0.14 * Math.sin(2 * theta + p1 + rIdx * 0.15) +
+        0.09 * Math.cos(3 * theta + p2);
+      const lx = Math.cos(theta) * rx * sc * lobe;
+      const ly = Math.sin(theta) * ry * sc * lobe;
+      ring.push({
+        x: x + lx * cos - ly * sin,
+        y: y + lx * sin + ly * cos,
+      });
+    }
+    return ring;
+  });
+
+  return { id, x, y, rx, ry, angle, rings: 3, ringsPoly };
+}
+
+function generateHills(rng, water, mountains) {
   const hills = [];
-  // 1 inner-valley hill + 2-3 outer-valley hills
   const specs = [
-    { minR: 130, maxR: 280, rxMin: 130, rxMax: 185, ryMin: 95, ryMax: 140 },
-    { minR: 420, maxR: 680, rxMin: 170, rxMax: 240, ryMin: 120, ryMax: 175 },
-    { minR: 500, maxR: 820, rxMin: 180, rxMax: 250, ryMin: 130, ryMax: 185 },
-    { minR: 620, maxR: 920, rxMin: 160, rxMax: 220, ryMin: 115, ryMax: 165 },
+    { minR: 150, maxR: 310, rxMin: 125, rxMax: 175, ryMin: 90, ryMax: 135 },
+    { minR: 410, maxR: 660, rxMin: 165, rxMax: 230, ryMin: 115, ryMax: 170 },
+    { minR: 490, maxR: 800, rxMin: 175, rxMax: 245, ryMin: 125, ryMax: 180 },
+    { minR: 580, maxR: 880, rxMin: 155, rxMax: 215, ryMin: 110, ryMax: 160 },
+    { minR: 640, maxR: 940, rxMin: 145, rxMax: 205, ryMin: 105, ryMax: 150 },
   ];
 
-  const count = 3 + (rng() > 0.4 ? 1 : 0);
+  const count = 3 + Math.floor(rng() * 3); // 3..5
   for (let i = 0; i < count; i++) {
     const spec = specs[i];
     let best = null;
-    for (let attempt = 0; attempt < 40; attempt++) {
+    for (let attempt = 0; attempt < 45; attempt++) {
       const angle = rng() * Math.PI * 2;
       const r = spec.minR + rng() * (spec.maxR - spec.minR);
       const x = Math.cos(angle) * r * 1.25;
       const y = Math.sin(angle) * r * 0.8;
-      if (distanceToRiver(river, x, y) < 110) continue;
-      const overlaps = hills.some((h) => Math.hypot(h.x - x, h.y - y) < 280);
+      if (distanceToRiver(water, x, y) < 105) continue;
+      if (isPointInMountain(mountains, x, y)) continue;
+      const nearMtn = mountains.some((m) => Math.hypot(m.x - x, m.y - y) < m.rx + 120);
+      if (nearMtn) continue;
+      const overlaps = hills.some((h) => Math.hypot(h.x - x, h.y - y) < 260);
       if (overlaps) continue;
-      best = {
-        id: i + 1,
+      best = createOrganicHill(
+        i + 1,
         x,
         y,
-        rx: spec.rxMin + rng() * (spec.rxMax - spec.rxMin),
-        ry: spec.ryMin + rng() * (spec.ryMax - spec.ryMin),
-        angle: rng() * Math.PI,
-        rings: 3,
-      };
+        spec.rxMin + rng() * (spec.rxMax - spec.rxMin),
+        spec.ryMin + rng() * (spec.ryMax - spec.ryMin),
+        rng() * Math.PI,
+        rng
+      );
       break;
     }
     if (best) hills.push(best);
   }
   return hills;
+}
+
+function generateArchetypeTerrain(state) {
+  const rng = state.rng;
+  const archetypes = ['confluence', 'mountainPass', 'lakeBay', 'gorge'];
+  const archetype = archetypes[Math.floor(rng() * archetypes.length)];
+  state.mapArchetype = archetype;
+
+  const rivers = [];
+  const lakes = [];
+  const mountains = [];
+
+  if (archetype === 'confluence') {
+    const mainRiver = generateRiver(rng, { halfWidth: 25, amp: 95 + rng() * 45 });
+    const trib = generateTributaryRiver(rng, mainRiver, rng() > 0.5);
+    rivers.push(mainRiver, trib);
+
+    const mSpecs = [
+      { x: 460 + rng() * 220, y: (rng() > 0.5 ? 1 : -1) * (270 + rng() * 130), rx: 145, ry: 95 },
+      { x: -520 - rng() * 200, y: (rng() > 0.5 ? 1 : -1) * (290 + rng() * 120), rx: 135, ry: 90 },
+    ];
+    for (let i = 0; i < mSpecs.length; i++) {
+      const ms = mSpecs[i];
+      if (distanceToRiver({ rivers, lakes }, ms.x, ms.y) > 95) {
+        mountains.push(createMountainMassif(i + 1, ms.x, ms.y, ms.rx, ms.ry, (rng() - 0.5) * 0.9, rng));
+      }
+    }
+  } else if (archetype === 'mountainPass') {
+    const mainRiver = generateRiver(rng, {
+      yOffset: (rng() > 0.5 ? 1 : -1) * 240,
+      amp: 70 + rng() * 35,
+      halfWidth: 24,
+    });
+    rivers.push(mainRiver);
+
+    const tilt = (rng() - 0.5) * 0.5;
+    const passGap = 155;
+    const m1 = createMountainMassif(1, -250 - rng() * 70, -passGap * 0.55 - 80, 160, 100, tilt, rng);
+    const m2 = createMountainMassif(2, 260 + rng() * 70, passGap * 0.55 + 75, 165, 105, tilt + 0.25, rng);
+    mountains.push(m1, m2);
+    if (rng() > 0.35) {
+      mountains.push(createMountainMassif(3, (rng() - 0.5) * 260, -440, 145, 92, rng() * 0.8, rng));
+    }
+  } else if (archetype === 'lakeBay') {
+    const lx = (rng() - 0.5) * 140;
+    const ly = (rng() - 0.5) * 90;
+    const lake = createLake(1, lx, ly, 165 + rng() * 35, 105 + rng() * 25, rng);
+    lakes.push(lake);
+
+    const inlet = generateRiver(rng, {
+      xStart: -1350,
+      xEnd: lx - 40,
+      yOffset: ly + (rng() - 0.5) * 80,
+      amp: 65,
+      halfWidth: 22,
+    });
+    const outlet = generateRiver(rng, {
+      xStart: lx + 40,
+      xEnd: 1350,
+      yOffset: ly + (rng() - 0.5) * 80,
+      amp: 75,
+      halfWidth: 25,
+    });
+    rivers.push(inlet, outlet);
+
+    mountains.push(
+      createMountainMassif(1, lx + (rng() > 0.5 ? 460 : -460), ly + (rng() > 0.5 ? -290 : 290), 150, 95, rng() * Math.PI, rng)
+    );
+  } else {
+    // 'gorge'
+    const canyonRiver = generateRiver(rng, {
+      halfWidth: 27,
+      amp: 175 + rng() * 45,
+      freq: 2.6,
+    });
+    rivers.push(canyonRiver);
+    mountains.push(
+      createMountainMassif(1, -340 + rng() * 80, -310, 150, 95, 0.35, rng),
+      createMountainMassif(2, 340 + rng() * 80, 310, 155, 98, -0.35, rng)
+    );
+  }
+
+  state.rivers = rivers;
+  state.river = rivers[0] || { points: [], halfWidth: 25 };
+  state.lakes = lakes;
+  state.mountains = mountains;
+  state.hills = generateHills(rng, { rivers, lakes }, mountains);
 }
 
 function createStation(id, x, y, spec) {
@@ -449,6 +873,7 @@ function createStation(id, x, y, spec) {
     goodsTarget,
     buildingSeeds: [],
     isInterchange: false,
+    needsFreightCue: false,
     queueAngle: 0,
     inputBuffer: 0,
     processProgress: 0,
@@ -463,6 +888,7 @@ function createStation(id, x, y, spec) {
 }
 
 function riverSideSign(river, x, y) {
+  if (!river?.points?.length) return y >= 0 ? 1 : -1;
   let closest = river.points[0];
   let bestDx = Infinity;
   for (const pt of river.points) {
@@ -475,18 +901,42 @@ function riverSideSign(river, x, y) {
   return y >= closest.y ? 1 : -1;
 }
 
+function shuffleInPlace(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr;
+}
+
 export function generateWorld(state) {
   const rng = state.rng;
-  state.river = generateRiver(rng);
-  state.hills = generateHills(rng, state.river);
+  generateArchetypeTerrain(state);
   state.stations = [];
   state.stationById = new Map();
   state.pendingSpawns = [];
   state.nextSpawnIndex = 0;
 
+  const water = { rivers: state.rivers, lakes: state.lakes };
   const placed = [];
+  const isClearOfTerrain = (x, y) => {
+    for (const r of state.rivers) {
+      if (distanceToSingleRiver(r, x, y) < (r.halfWidth || 25) + 30) return false;
+    }
+    for (const l of state.lakes) {
+      if (isPointInPolygon(l.points, x, y) || distanceToPolyBoundary(l.points, x, y) < 34) return false;
+    }
+    for (const m of state.mountains) {
+      if (isPointInPolygon(m.outerPoly, x, y) || distanceToPolyBoundary(m.outerPoly, x, y) < 22) {
+        return false;
+      }
+    }
+    return true;
+  };
   const canPlace = (x, y, minDist) => {
-    if (distanceToRiver(state.river, x, y) < state.river.halfWidth + 30) return false;
+    if (!isClearOfTerrain(x, y)) return false;
     return placed.every((p) => Math.hypot(p.x - x, p.y - y) >= minDist);
   };
 
@@ -496,25 +946,29 @@ export function generateWorld(state) {
   let s2Pos = null;
   const starterSide = rng() > 0.5 ? 1 : -1;
 
-  for (let outer = 0; outer < 40 && !s2Pos; outer++) {
-    const c1x = (rng() * 2 - 1) * 350;
-    const c1y = (rng() * 2 - 1) * 195;
-    if (riverSideSign(state.river, c1x, c1y) !== starterSide) continue;
+  for (let outer = 0; outer < 60 && !s2Pos; outer++) {
+    const c1x = (rng() * 2 - 1) * 360;
+    const c1y = (rng() * 2 - 1) * 205;
+    if (outer < 45 && riverSideSign(state.river, c1x, c1y) !== starterSide) continue;
     if (!canPlace(c1x, c1y, 175)) continue;
 
-    // Station 2: Starter Hamlet (Oakridge, Tier 1) on same river side, 200..310u from Station 1
-    for (let inner = 0; inner < 60; inner++) {
+    // Station 2: Starter Hamlet (Oakridge, Tier 1) with 0 river and 0 mountain crossings
+    for (let inner = 0; inner < 65; inner++) {
       const ang = rng() * Math.PI * 2;
       const dist = 205 + rng() * 100; // 205..305 units
       const c2x = c1x + Math.cos(ang) * dist;
       const c2y = c1y + Math.sin(ang) * dist;
-      if (Math.abs(c2x) > 405 || Math.abs(c2y) > 215) continue;
-      if (riverSideSign(state.river, c2x, c2y) !== starterSide) continue;
-      if (distanceToRiver(state.river, c2x, c2y) < state.river.halfWidth + 30) continue;
+      if (Math.abs(c2x) > 420 || Math.abs(c2y) > 225) continue;
+      if (!canPlace(c2x, c2y, 175)) continue;
       if (Math.hypot(c2x - c1x, c2y - c1y) < 200) continue;
 
-      const pts = buildOctilinearPoints(c1x, c1y, c2x, c2y, state.river, state.hills);
-      if (countRiverCrossings(pts, state.river) === 0) {
+      const pts = buildOctilinearPoints(c1x, c1y, c2x, c2y, water, state.hills, {
+        mountains: state.mountains,
+      });
+      if (
+        countRiverCrossings(pts, water) === 0 &&
+        countMountainCrossings(pts, state.mountains) === 0
+      ) {
         s1Pos = { x: c1x, y: c1y };
         s2Pos = { x: c2x, y: c2y };
         break;
@@ -522,94 +976,99 @@ export function generateWorld(state) {
     }
   }
 
-  // Fallback if river geometry made strict same-side search tight
+  // Fallback search on grid if strict random search didn't find a pair
   if (!s1Pos || !s2Pos) {
-    s1Pos = s1Pos || { x: -160, y: starterSide * 130 };
-    s2Pos = { x: 95, y: starterSide * 135 };
+    outerFallback: for (let gy = -200; gy <= 200; gy += 40) {
+      for (let gx = -360; gx <= 120; gx += 45) {
+        if (!canPlace(gx, gy, 175)) continue;
+        const c2x = gx + 220;
+        const c2y = gy;
+        if (!canPlace(c2x, c2y, 175)) continue;
+        const pts = buildOctilinearPoints(gx, gy, c2x, c2y, water, state.hills, {
+          mountains: state.mountains,
+        });
+        if (
+          countRiverCrossings(pts, water) === 0 &&
+          countMountainCrossings(pts, state.mountains) === 0
+        ) {
+          s1Pos = { x: gx, y: gy };
+          s2Pos = { x: c2x, y: c2y };
+          break outerFallback;
+        }
+      }
+    }
+  }
+  if (!s1Pos || !s2Pos) {
+    s1Pos = s1Pos || { x: -160, y: starterSide * 150 };
+    s2Pos = { x: 95, y: starterSide * 150 };
   }
 
-  const s1 = createStation(
-    1,
-    s1Pos.x,
-    s1Pos.y,
-    {
-      kind: 'settlement',
-      subtype: 'city',
-      name: CONFIG.SETTLEMENT_NAMES[0][0], // Grandhaven
-      tier: 3,
-      cityCode: CONFIG.SETTLEMENT_NAMES[0][1], // GH
-      crestColor: CONFIG.CITY_CREST_PALETTE[0],
-    },
-    rng
-  );
+  const s1 = createStation(1, s1Pos.x, s1Pos.y, {
+    kind: 'settlement',
+    subtype: 'city',
+    name: CONFIG.SETTLEMENT_NAMES[0][0], // Grandhaven
+    tier: 3,
+    cityCode: CONFIG.SETTLEMENT_NAMES[0][1], // GH
+    crestColor: CONFIG.CITY_CREST_PALETTE[0],
+  });
   placed.push(s1);
   state.stations.push(s1);
   state.stationById.set(s1.id, s1);
 
-  const s2 = createStation(
-    2,
-    s2Pos.x,
-    s2Pos.y,
-    {
-      kind: 'settlement',
-      subtype: 'hamlet',
-      name: CONFIG.SETTLEMENT_NAMES[1][0], // Oakridge
-      tier: 1,
-    },
-    rng
-  );
+  const s2 = createStation(2, s2Pos.x, s2Pos.y, {
+    kind: 'settlement',
+    subtype: 'hamlet',
+    name: CONFIG.SETTLEMENT_NAMES[1][0], // Oakridge
+    tier: 1,
+  });
   placed.push(s2);
   state.stations.push(s2);
   state.stationById.set(s2.id, s2);
 
-  // Station 3: Starter Resource Site (Timber Camp, forest) on opposite side of river
+  // Station 3: Starter Resource Site (Timber Camp, forest)
   let s3Pos = null;
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const x = (rng() * 2 - 1) * 390;
-    const y = (rng() * 2 - 1) * 210;
-    if (riverSideSign(state.river, x, y) === starterSide && attempt < 95) continue;
-    if (canPlace(x, y, 185)) {
+  for (let attempt = 0; attempt < 140; attempt++) {
+    const x = (rng() * 2 - 1) * 405;
+    const y = (rng() * 2 - 1) * 220;
+    if (riverSideSign(state.river, x, y) === starterSide && attempt < 100) continue;
+    if (canPlace(x, y, 180)) {
       s3Pos = { x, y };
       break;
     }
   }
   if (!s3Pos) {
-    s3Pos = { x: -240, y: -starterSide * 145 };
+    s3Pos = { x: -240, y: -starterSide * 155 };
   }
 
-  const s3 = createStation(
-    3,
-    s3Pos.x,
-    s3Pos.y,
-    {
-      kind: 'resource',
-      subtype: 'forest',
-      name: CONFIG.INDUSTRY_NAMES.forest[0], // Timber Camp
-    },
-    rng
-  );
+  const s3 = createStation(3, s3Pos.x, s3Pos.y, {
+    kind: 'resource',
+    subtype: 'forest',
+    name: CONFIG.INDUSTRY_NAMES.forest[0], // Timber Camp
+  });
   placed.push(s3);
   state.stations.push(s3);
   state.stationById.set(s3.id, s3);
 
   // Station 4: Starter Factory (Millworks) positioned between Timber Camp and Grandhaven/Oakridge
-  // Ensure at least one river or hill interaction across the freight corridor (3 -> 4 -> 1/2)
   let s4Pos = null;
   let bestScore = Infinity;
   const midTargetX = (s3.x + (s1.x + s2.x) * 0.5) * 0.5;
   const midTargetY = (s3.y + (s1.y + s2.y) * 0.5) * 0.5;
 
-  for (let attempt = 0; attempt < 140; attempt++) {
-    const x = (rng() * 2 - 1) * 395;
-    const y = (rng() * 2 - 1) * 210;
-    if (!canPlace(x, y, 175)) continue;
+  for (let attempt = 0; attempt < 160; attempt++) {
+    const x = (rng() * 2 - 1) * 410;
+    const y = (rng() * 2 - 1) * 220;
+    if (!canPlace(x, y, 170)) continue;
 
-    const legA = buildOctilinearPoints(s3.x, s3.y, x, y, state.river, state.hills);
-    const legB = buildOctilinearPoints(x, y, s1.x, s1.y, state.river, state.hills);
+    const legA = buildOctilinearPoints(s3.x, s3.y, x, y, water, state.hills, {
+      mountains: state.mountains,
+    });
+    const legB = buildOctilinearPoints(x, y, s1.x, s1.y, water, state.hills, {
+      mountains: state.mountains,
+    });
     const lenA = computePolylineLengths(legA);
     const lenB = computePolylineLengths(legB);
-    const crossings =
-      countRiverCrossings(legA, state.river) + countRiverCrossings(legB, state.river);
+    const crossings = countRiverCrossings(legA, water) + countRiverCrossings(legB, water);
     const hillHits =
       computeHillIntervals(legA, lenA.cumLengths, lenA.totalLength, state.hills).length +
       computeHillIntervals(legB, lenB.cumLengths, lenB.totalLength, state.hills).length;
@@ -625,20 +1084,14 @@ export function generateWorld(state) {
     }
   }
   if (!s4Pos) {
-    s4Pos = { x: 240, y: -starterSide * 140 };
+    s4Pos = { x: 240, y: -starterSide * 150 };
   }
 
-  const s4 = createStation(
-    4,
-    s4Pos.x,
-    s4Pos.y,
-    {
-      kind: 'factory',
-      subtype: 'factory',
-      name: CONFIG.INDUSTRY_NAMES.factory[0], // Millworks
-    },
-    rng
-  );
+  const s4 = createStation(4, s4Pos.x, s4Pos.y, {
+    kind: 'factory',
+    subtype: 'factory',
+    name: CONFIG.INDUSTRY_NAMES.factory[0], // Millworks
+  });
   placed.push(s4);
   state.stations.push(s4);
   state.stationById.set(s4.id, s4);
@@ -648,46 +1101,77 @@ export function generateWorld(state) {
     state.onboarding.freightLineBuilt = false;
   }
 
-  // --- Progressive 18-Node Regional Expansion Schedule ---
-  // Spawn #5 is Northport (NP) City so Intercity Tickets activate smoothly mid-game.
-  const expansionSchedule = [
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #1
-    { kind: 'resource', subtype: 'mine' },               // #2
-    { kind: 'factory', subtype: 'factory' },             // #3
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #4
-    { kind: 'settlement', subtype: 'city', tier: 3 },   // #5 (Northport NP)
-    { kind: 'resource', subtype: 'forest' },             // #6
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #7
-    { kind: 'factory', subtype: 'factory' },             // #8
-    { kind: 'resource', subtype: 'mine' },               // #9
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #10
-    { kind: 'resource', subtype: 'forest' },             // #11
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #12
-    { kind: 'factory', subtype: 'factory' },             // #13
-    { kind: 'resource', subtype: 'mine' },               // #14
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #15
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #16
-    { kind: 'resource', subtype: 'forest' },             // #17
-    { kind: 'settlement', subtype: 'hamlet', tier: 1 }, // #18
+  // --- Randomized 22-Node Regional Expansion Schedule (shuffled within balanced 4-5 node waves) ---
+  const waves = [
+    [
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+      { kind: 'resource', subtype: 'mine' },
+      { kind: 'factory', subtype: 'factory' },
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+    ],
+    [
+      { kind: 'settlement', subtype: 'city', tier: 3 },
+      { kind: 'resource', subtype: 'forest' },
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+      { kind: 'factory', subtype: 'factory' },
+      { kind: 'resource', subtype: 'mine' },
+    ],
+    [
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+      { kind: 'resource', subtype: 'forest' },
+      { kind: 'factory', subtype: 'factory' },
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+    ],
+    [
+      { kind: 'settlement', subtype: 'city', tier: 3 },
+      { kind: 'resource', subtype: 'mine' },
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+      { kind: 'resource', subtype: 'forest' },
+      { kind: 'factory', subtype: 'factory' },
+    ],
+    [
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+      { kind: 'resource', subtype: 'mine' },
+      { kind: 'resource', subtype: 'forest' },
+      { kind: 'settlement', subtype: 'hamlet', tier: 1 },
+    ],
   ];
 
-  // Track next unused name indices (starters claimed Grandhaven, Oakridge, Timber Camp, Millworks;
-  // Northport NP is reserved for the mid-game city at spawn #5)
-  const hamletPool = CONFIG.SETTLEMENT_NAMES.filter(
-    ([name]) => name !== 'Grandhaven' && name !== 'Oakridge' && name !== 'Northport'
+  const expansionSchedule = [];
+  for (const w of waves) {
+    shuffleInPlace(w, rng);
+    expansionSchedule.push(...w);
+  }
+
+  // Shuffle available settlement & industry names per seed (reserving starters)
+  const northport = CONFIG.SETTLEMENT_NAMES.find(([n]) => n === 'Northport') || ['Northport', 'NP'];
+  const remainingSettlements = shuffleInPlace(
+    CONFIG.SETTLEMENT_NAMES.filter(
+      ([name]) => name !== 'Grandhaven' && name !== 'Oakridge' && name !== 'Northport'
+    ),
+    rng
   );
+  const cityPool = [northport, ...remainingSettlements.slice(0, 2)];
+  const hamletPool = remainingSettlements.slice(1);
+
+  const forestPool = shuffleInPlace(CONFIG.INDUSTRY_NAMES.forest.slice(1), rng);
+  const minePool = shuffleInPlace(CONFIG.INDUSTRY_NAMES.mine.slice(), rng);
+  const factoryPool = shuffleInPlace(CONFIG.INDUSTRY_NAMES.factory.slice(1), rng);
+  const industryPools = { forest: forestPool, mine: minePool, factory: factoryPool };
+  const industryIdx = { forest: 0, mine: 0, factory: 0 };
+
+  let cityIdx = 0;
   let hamletIdx = 0;
   let crestIdx = 1;
-  const industryIdx = { forest: 1, mine: 0, factory: 1 };
 
   for (let i = 0; i < expansionSchedule.length; i++) {
     const entry = expansionSchedule[i];
     const t = i / (expansionSchedule.length - 1);
-    const minRadius = 240 + t * 380;
-    const maxRadius = 460 + t * 560;
+    const minRadius = 240 + t * 390;
+    const maxRadius = 460 + t * 570;
     let chosen = null;
 
-    for (let attempt = 0; attempt < 120; attempt++) {
+    for (let attempt = 0; attempt < 140; attempt++) {
       const ang = rng() * Math.PI * 2;
       const rad = minRadius + rng() * (maxRadius - minRadius);
       const x = Math.max(-1080, Math.min(1080, Math.cos(ang) * rad * 1.28));
@@ -704,7 +1188,7 @@ export function generateWorld(state) {
       if (entry.kind === 'settlement') {
         const isCity = entry.tier === 3;
         const pair = isCity
-          ? CONFIG.SETTLEMENT_NAMES.find(([n]) => n === 'Northport') || ['Northport', 'NP']
+          ? cityPool[cityIdx++ % cityPool.length]
           : hamletPool[hamletIdx++ % hamletPool.length];
         spec = {
           kind: 'settlement',
@@ -717,7 +1201,7 @@ export function generateWorld(state) {
             : null,
         };
       } else {
-        const pool = CONFIG.INDUSTRY_NAMES[entry.subtype];
+        const pool = industryPools[entry.subtype];
         const idx = industryIdx[entry.subtype]++;
         spec = {
           kind: entry.kind,
@@ -726,7 +1210,7 @@ export function generateWorld(state) {
         };
       }
 
-      const st = createStation(id, chosen.x, chosen.y, spec, rng);
+      const st = createStation(id, chosen.x, chosen.y, spec);
       placed.push(st);
       state.pendingSpawns.push(st);
     }
@@ -985,6 +1469,65 @@ export function computeTrainUnitPoses(
   return poses;
 }
 
+export function projectPointOntoSpine(spine, wx, wy) {
+  if (!spine || !Array.isArray(spine.points) || spine.points.length < 2 || !Array.isArray(spine.cumLengths)) {
+    return { u: 0, x: wx, y: wy, dist: Infinity, legIndex: 0 };
+  }
+
+  const pts = spine.points;
+  const cum = spine.cumLengths;
+  let bestDistSq = Infinity;
+  let bestU = 0;
+  let bestX = pts[0].x;
+  let bestY = pts[0].y;
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const ax = pts[i].x;
+    const ay = pts[i].y;
+    const bx = pts[i + 1].x;
+    const by = pts[i + 1].y;
+    const vx = bx - ax;
+    const vy = by - ay;
+    const lenSq = vx * vx + vy * vy;
+    const t = lenSq > 0 ? Math.max(0, Math.min(1, ((wx - ax) * vx + (wy - ay) * vy) / lenSq)) : 0;
+    const px = ax + t * vx;
+    const py = ay + t * vy;
+    const dSq = dist2(wx, wy, px, py);
+    if (dSq < bestDistSq) {
+      bestDistSq = dSq;
+      bestX = px;
+      bestY = py;
+      const segLen = (cum[i + 1] ?? cum[i]) - cum[i];
+      bestU = cum[i] + t * segLen;
+    }
+  }
+
+  let legIndex = 0;
+  const stU = spine.stationU;
+  if (Array.isArray(stU) && stU.length >= 2) {
+    const maxLeg = spine.isLoop ? stU.length - 1 : stU.length - 2;
+    for (let i = 0; i <= maxLeg; i++) {
+      const startU = stU[i];
+      const endU = i + 1 < stU.length ? stU[i + 1] : spine.totalLength;
+      if (bestU >= startU - 1e-3 && bestU <= endU + 1e-3) {
+        legIndex = i;
+        break;
+      }
+      if (bestU > endU) {
+        legIndex = i;
+      }
+    }
+  }
+
+  return {
+    u: bestU,
+    x: bestX,
+    y: bestY,
+    dist: Math.sqrt(bestDistSq),
+    legIndex,
+  };
+}
+
 export function getLineTBarPose(state, line, endSide) {
   if (!line || !Array.isArray(line.stations) || line.stations.length < 2 || line.isLoop) {
     return null;
@@ -1063,11 +1606,13 @@ export function computeStationQueueAngle(state, station) {
       }
     }
 
-    if (state?.river?.points?.length) {
-      const dRiver = distanceToRiver(state.river, px, py);
-      if (dRiver < (state.river.halfWidth || 25) + 24) {
-        score += 800;
-      }
+    const dWater = distanceToRiver(state, px, py);
+    if (dWater < (state?.river?.halfWidth || 25) + 24) {
+      score += 800;
+    }
+
+    if (isPointInMountain(state?.mountains, px, py)) {
+      score += 700;
     }
 
     if (Math.abs(px) > 1050 || Math.abs(py) > 600) {

@@ -9,7 +9,23 @@ import { setupUI } from './ui.js';
 const canvas = document.getElementById('game-canvas');
 const ctx = canvas.getContext('2d');
 
-let state = createInitialState(133742);
+function parseInitialSeed() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get('seed');
+    if (raw !== null && raw.trim() !== '') {
+      const parsed = Number(raw.trim());
+      if (Number.isInteger(parsed)) {
+        return parsed >>> 0;
+      }
+    }
+  } catch {
+    // ignore URL parsing errors
+  }
+  return Math.floor(Math.random() * 0xffffffff);
+}
+
+let state = createInitialState(parseInitialSeed());
 try {
   const savedTheme = localStorage.getItem('minirail-theme');
   if (savedTheme === 'night' || savedTheme === 'day') {
@@ -58,6 +74,9 @@ const ui = setupUI(state, {
 setupInput(canvas, state, {
   onNetworkChanged() {
     ui.syncUI();
+  },
+  onLineStep() {
+    ui.hooks.onLineStep();
   },
 });
 

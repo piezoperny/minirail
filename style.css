@@ -160,6 +160,21 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
+.endless-pill {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.14);
+  color: var(--accent);
+  border: 1px solid rgba(59, 130, 246, 0.32);
+}
+
+.endless-pill.hidden {
+  display: none;
+}
+
 .score-pill {
   position: relative;
   display: inline-flex;
@@ -674,6 +689,27 @@ body,
   margin-top: 0;
 }
 
+.endless-btn {
+  grid-column: 1 / -1;
+  border: none;
+  border-radius: 12px;
+  padding: 11px 18px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  background: var(--accent);
+  color: #FFFDF9;
+  transition: opacity 0.15s ease, transform 0.1s ease;
+}
+
+.endless-btn:hover {
+  opacity: 0.92;
+}
+
+.endless-btn.hidden {
+  display: none;
+}
+
 .help-card {
   max-width: 520px;
   text-align: left;
@@ -688,4 +724,28 @@ body,
   font-size: 13px;
   line-height: 1.45;
   color: var(--ink);
+}
+
+.help-seed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--paper-bg);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.help-seed-row strong {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.small-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 8px;
 }

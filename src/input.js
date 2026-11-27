@@ -11,15 +11,17 @@ import {
   applyCorridorUpgrade,
   applyStationUpgrade,
   attachCarToTrain,
-  deployTrainOnLine,
+  deployTrainAtWorldPos,
   extendOrStartLine,
   getLineEdges,
   insertStationIntoLine,
-  moveTrainToLine,
+  moveTrainToWorldPos,
   reclaimCorridorUpgrade,
   reclaimTrainToInventory,
   removeSegmentFromLine,
   removeStationFromLine,
+  replaceStationInLine,
+  trimLineEnd,
 } from './simulation.js';
 
 function syncStationHoverTargets(state) {
@@ -152,18 +154,41 @@ function chooseLineForStationDrag(state, stationId) {
   return null;
 }
 
+function findInteriorLineForStation(state, stationId, preferActiveOnly = false) {
+  const checkLine = (line) => {
+    if (!line || line.id >= state.unlockedLines || line.stations.length < 3) return null;
+    const idx = line.stations.indexOf(stationId);
+    if (idx === -1) return null;
+    if (!line.isLoop && (idx === 0 || idx === line.stations.length - 1)) return null;
+    const n = line.stations.length;
+    const prevId = idx > 0 ? line.stations[idx - 1] : line.stations[n - 1];
+    const nextId = idx < n - 1 ? line.stations[idx + 1] : line.stations[0];
+    return { lineId: line.id, prevId, nextId };
+  };
+
+  const activeHit = checkLine(state.lines[state.activeLineId]);
+  if (activeHit) return activeHit;
+  if (preferActiveOnly) return null;
+
+  for (let i = state.unlockedLines - 1; i >= 0; i--) {
+    const hit = checkLine(state.lines[i]);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 function applyToolAtWorldPos(state, tool, wx, wy) {
   if (tool === 'express' || tool === 'freight') {
     const corridor = hitTestCorridor(state, wx, wy);
     if (corridor) {
       const ids = Array.from(corridor.activeLineIds);
       const lineId = ids.includes(state.activeLineId) ? state.activeLineId : ids[0];
-      return deployTrainOnLine(state, tool, lineId, corridor.aId);
+      return deployTrainAtWorldPos(state, tool, lineId, wx, wy);
     }
     const st = hitTestStation(state, wx, wy);
     if (st) {
       const line = state.lines.find((l) => l.stations.includes(st.id) && l.stations.length >= 2);
-      if (line) return deployTrainOnLine(state, tool, line.id, st.id);
+      if (line) return deployTrainAtWorldPos(state, tool, line.id, st.x, st.y);
     }
     return { ok: false, reason: 'Drop on an active rail line' };
   }
@@ -394,6 +419,7 @@ export function setupInput(canvas, state, callbacks) {
       state.interaction.drag = {
         lineId: tbar.lineId,
         fromStationId: tbar.stationId,
+        endSide: tbar.end,
         snapStationId: null,
         worldX: x,
         worldY: y,
@@ -402,19 +428,68 @@ export function setupInput(canvas, state, callbacks) {
       return;
     }
 
-    // 3. Check station drag to start/extend line
+    // 3. Check station drag: detach interior station OR start/extend line
     const st = hitTestStation(state, x, y);
     if (st) {
+      const activeLine = state.lines[state.activeLineId];
+      const activeIsEmpty = activeLine && activeLine.id < state.unlockedLines && activeLine.stations.length === 0;
+      const activeInterior = !activeIsEmpty ? findInteriorLineForStation(state, st.id, true) : null;
+
+      if (activeInterior) {
+        state.activeLineId = activeInterior.lineId;
+        state.interaction.mode = 'detachStation';
+        state.interaction.drag = {
+          lineId: activeInterior.lineId,
+          stationId: st.id,
+          prevId: activeInterior.prevId,
+          nextId: activeInterior.nextId,
+          detached: false,
+          snapStationId: null,
+          worldX: x,
+          worldY: y,
+        };
+        callbacks.onNetworkChanged?.();
+        return;
+      }
+
+      const anyInterior = !activeIsEmpty ? findInteriorLineForStation(state, st.id, false) : null;
       const lineId = chooseLineForStationDrag(state, st.id);
+      const chosenLine = lineId !== null ? state.lines[lineId] : null;
+      const chosenIsEndpoint =
+        chosenLine &&
+        chosenLine.stations.length >= 2 &&
+        !chosenLine.isLoop &&
+        (chosenLine.stations[0] === st.id || chosenLine.stations[chosenLine.stations.length - 1] === st.id);
+
+      if (anyInterior && !chosenIsEndpoint) {
+        state.activeLineId = anyInterior.lineId;
+        state.interaction.mode = 'detachStation';
+        state.interaction.drag = {
+          lineId: anyInterior.lineId,
+          stationId: st.id,
+          prevId: anyInterior.prevId,
+          nextId: anyInterior.nextId,
+          detached: false,
+          snapStationId: null,
+          worldX: x,
+          worldY: y,
+        };
+        callbacks.onNetworkChanged?.();
+        return;
+      }
+
       if (lineId === null) {
         showHint(state, 'All unlocked lines are in use — extend an existing line end.');
         return;
       }
+      const endSide =
+        chosenLine && chosenLine.stations.length >= 2 && chosenLine.stations[0] === st.id ? 'start' : 'end';
       state.activeLineId = lineId;
       state.interaction.mode = 'buildLine';
       state.interaction.drag = {
         lineId,
         fromStationId: st.id,
+        endSide,
         snapStationId: null,
         worldX: x,
         worldY: y,
@@ -502,11 +577,121 @@ export function setupInput(canvas, state, callbacks) {
 
     const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
 
-    if (mode === 'buildLine' || mode === 'insertNode') {
+    if (mode === 'buildLine') {
+      drag.worldX = x;
+      drag.worldY = y;
+      const line = state.lines[drag.lineId];
+
+      // 1. Pull-Out T-Bar Shortening (>= 34u backward pull toward previous station)
+      if (line && !line.isLoop && line.stations.length >= 2) {
+        let prevId = null;
+        if (drag.endSide === 'end' && line.stations[line.stations.length - 1] === drag.fromStationId) {
+          prevId = line.stations[line.stations.length - 2];
+        } else if (drag.endSide === 'start' && line.stations[0] === drag.fromStationId) {
+          prevId = line.stations[1];
+        }
+        if (prevId !== null) {
+          const E = state.stationById.get(drag.fromStationId);
+          const Prev = state.stationById.get(prevId);
+          if (E && Prev) {
+            const vx = Prev.x - E.x;
+            const vy = Prev.y - E.y;
+            const len = Math.hypot(vx, vy);
+            if (len > 1e-4) {
+              const backDist = ((x - E.x) * vx + (y - E.y) * vy) / len;
+              if (backDist >= 34) {
+                const trimRes = trimLineEnd(state, drag.lineId, drag.endSide);
+                if (trimRes.ok) {
+                  callbacks.onLineStep?.();
+                  callbacks.onNetworkChanged?.();
+                  if (line.stations.length >= 2) {
+                    drag.fromStationId = Prev.id;
+                  } else {
+                    state.interaction.mode = 'idle';
+                    state.interaction.drag = null;
+                    state.interaction.hoveredStationId = null;
+                    syncStationHoverTargets(state);
+                    canvas.style.cursor = spaceHeld ? 'grab' : 'default';
+                    return;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Continuous One-Stroke Sweep
+      const snap = hitTestStation(state, x, y, 25);
+      if (snap && snap.id !== drag.fromStationId) {
+        const isUnwind =
+          line &&
+          !line.isLoop &&
+          line.stations.length >= 2 &&
+          ((drag.endSide === 'end' &&
+            line.stations[line.stations.length - 1] === drag.fromStationId &&
+            line.stations[line.stations.length - 2] === snap.id) ||
+            (drag.endSide === 'start' &&
+              line.stations[0] === drag.fromStationId &&
+              line.stations[1] === snap.id));
+
+        if (isUnwind) {
+          const trimRes = trimLineEnd(state, drag.lineId, drag.endSide);
+          if (trimRes.ok) {
+            drag.fromStationId = snap.id;
+            if (line.stations.length === 0) drag.endSide = 'end';
+            drag.snapStationId = null;
+            callbacks.onLineStep?.();
+            callbacks.onNetworkChanged?.();
+          }
+        } else {
+          const res = extendOrStartLine(state, drag.lineId, drag.fromStationId, snap.id);
+          if (res.ok) {
+            drag.fromStationId = snap.id;
+            drag.endSide = line && line.stations[0] === snap.id ? 'start' : 'end';
+            drag.snapStationId = null;
+            callbacks.onLineStep?.();
+            callbacks.onNetworkChanged?.();
+            if (line && line.isLoop) {
+              state.interaction.mode = 'idle';
+              state.interaction.drag = null;
+              state.interaction.hoveredStationId = null;
+              syncStationHoverTargets(state);
+              canvas.style.cursor = spaceHeld ? 'grab' : 'default';
+              return;
+            }
+          } else {
+            drag.snapStationId = snap.id;
+          }
+        }
+      } else {
+        drag.snapStationId = null;
+      }
+
+      state.interaction.hoveredStationId = drag.snapStationId;
+      syncStationHoverTargets(state);
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+
+    if (mode === 'insertNode') {
       drag.worldX = x;
       drag.worldY = y;
       const snap = hitTestStation(state, x, y, 30);
       drag.snapStationId = snap && snap.id !== drag.fromStationId ? snap.id : null;
+      state.interaction.hoveredStationId = drag.snapStationId;
+      syncStationHoverTargets(state);
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+
+    if (mode === 'detachStation') {
+      drag.worldX = x;
+      drag.worldY = y;
+      const st = state.stationById.get(drag.stationId);
+      drag.detached = st ? Math.hypot(x - st.x, y - st.y) >= 28 : false;
+      const snap = drag.detached ? hitTestStation(state, x, y, 25) : null;
+      drag.snapStationId = snap && snap.id !== drag.stationId ? snap.id : null;
       state.interaction.hoveredStationId = drag.snapStationId;
       syncStationHoverTargets(state);
       canvas.style.cursor = 'grabbing';
@@ -566,7 +751,7 @@ export function setupInput(canvas, state, callbacks) {
     }
     if (!drag) return;
 
-    if (mode === 'buildLine' || mode === 'insertNode') {
+    if (mode === 'buildLine' || mode === 'insertNode' || mode === 'detachStation') {
       state.interaction.hoveredStationId = null;
       syncStationHoverTargets(state);
     }
@@ -574,15 +759,42 @@ export function setupInput(canvas, state, callbacks) {
     if (state.phase !== 'playing') return;
     const { x, y } = getWorldPosFromClient(e.clientX, e.clientY);
 
-    if (mode === 'buildLine' && drag.snapStationId) {
-      const res = extendOrStartLine(state, drag.lineId, drag.fromStationId, drag.snapStationId);
-      if (!res.ok && res.reason) {
-        const target = state.stationById.get(drag.snapStationId);
-        if (target) {
-          state.interaction.flashMessage = { text: res.reason, x: target.x, y: target.y, timer: 1.4 };
+    if (mode === 'buildLine') {
+      if (drag.snapStationId) {
+        const res = extendOrStartLine(state, drag.lineId, drag.fromStationId, drag.snapStationId);
+        if (!res.ok && res.reason) {
+          const target = state.stationById.get(drag.snapStationId);
+          if (target) {
+            state.interaction.flashMessage = { text: res.reason, x: target.x, y: target.y, timer: 1.4 };
+          }
         }
       }
       callbacks.onNetworkChanged?.();
+    } else if (mode === 'detachStation') {
+      if (drag.detached) {
+        if (drag.snapStationId) {
+          const res = replaceStationInLine(state, drag.lineId, drag.stationId, drag.snapStationId);
+          if (!res.ok && res.reason) {
+            const target = state.stationById.get(drag.snapStationId);
+            if (target) {
+              state.interaction.flashMessage = { text: res.reason, x: target.x, y: target.y, timer: 1.4 };
+            }
+          } else if (res.ok) {
+            callbacks.onLineStep?.();
+          }
+        } else {
+          const res = removeStationFromLine(state, drag.lineId, drag.stationId);
+          if (!res.ok && res.reason) {
+            const st = state.stationById.get(drag.stationId);
+            if (st) {
+              state.interaction.flashMessage = { text: res.reason, x: st.x, y: st.y, timer: 1.4 };
+            }
+          } else if (res.ok) {
+            callbacks.onLineStep?.();
+          }
+        }
+        callbacks.onNetworkChanged?.();
+      }
     } else if (mode === 'insertNode' && drag.snapStationId) {
       const res = insertStationIntoLine(
         state,
@@ -624,7 +836,7 @@ export function setupInput(canvas, state, callbacks) {
       if (corridor) {
         const ids = Array.from(corridor.activeLineIds);
         const lineId = ids.includes(state.activeLineId) ? state.activeLineId : ids[0];
-        moveTrainToLine(state, drag.trainId, lineId, corridor.aId);
+        moveTrainToWorldPos(state, drag.trainId, lineId, x, y);
         callbacks.onNetworkChanged?.();
         return;
       }
@@ -632,7 +844,7 @@ export function setupInput(canvas, state, callbacks) {
       if (st) {
         const line = state.lines.find((l) => l.stations.includes(st.id) && l.stations.length >= 2);
         if (line) {
-          moveTrainToLine(state, drag.trainId, line.id, st.id);
+          moveTrainToWorldPos(state, drag.trainId, line.id, st.x, st.y);
           callbacks.onNetworkChanged?.();
         }
       }

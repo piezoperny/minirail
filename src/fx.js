@@ -8,6 +8,7 @@ export function createFXState() {
     pulses: [],
     ripplesOffset: 0,
     onboardingPhase: 0,
+    cuePhase: 0,
   };
 }
 
@@ -117,6 +118,7 @@ export function stepFX(state, dt) {
   // River current ripple phase & wordless onboarding loop timer
   fx.ripplesOffset = (fx.ripplesOffset + clampedDt * 24) % 10000;
   fx.onboardingPhase = ((fx.onboardingPhase || 0) + clampedDt * 0.45) % 1;
+  fx.cuePhase = ((fx.cuePhase || 0) + clampedDt * 3.0) % (Math.PI * 2);
 
   // Exhaust & factory smoke puffs
   for (let i = fx.puffs.length - 1; i >= 0; i--) {
